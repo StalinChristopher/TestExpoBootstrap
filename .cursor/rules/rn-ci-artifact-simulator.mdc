@@ -1,0 +1,29 @@
+---
+description: Install downloaded iOS simulator .app artifact from CI
+alwaysApply: false
+---
+
+# iOS simulator artifact from CI
+
+## Artifact
+
+When `rn-job-ios-simulator-artifact.yml` runs (for example after you wire it into a workflow or add a `workflow_dispatch` caller), it uploads a **Debug-Dev** simulator `.app` (default artifact name e.g. `Dev-iphonesimulator-Debug-Dev`). The default `rn.yml` orchestrator does **not** invoke that job.
+
+1. Download and unzip the artifact; locate `*.app` (e.g. `Dev.app` or your app display name from the Dev flavor).
+
+2. Boot a simulator (Xcode **Open Developer Tool → Simulator**) or list devices:
+
+   ```bash
+   xcrun simctl list devices available
+   ```
+
+3. Install and launch (replace app path if needed; bundle id matches Debug / CI `product_bundle_identifier`):
+
+   ```bash
+   xcrun simctl install booted /full/path/to/YourApp.app
+   xcrun simctl launch booted com.codeandtheory.templatepipelinetest.dev
+   ```
+
+## Android
+
+For APKs from `rn-job-android-build-bare` or debug workflows, use `adb install` after unzipping; see your Android template’s `android-ci-artifact-apk` rule for the same flow.

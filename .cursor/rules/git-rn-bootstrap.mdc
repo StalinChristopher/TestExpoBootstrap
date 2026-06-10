@@ -1,0 +1,12 @@
+---
+description: Git init and first commit for React Native + pipeline template repos
+alwaysApply: false
+---
+
+# Git bootstrap (RN)
+
+1. `git init` at the repository root (same level as `package.json` and `android/`).
+2. `git branch -M main` if the default branch is not `main`.
+3. Ensure `.gitignore` excludes `node_modules/`, `ios/Pods/`, `android/.gradle/`, `android/app/build/`, `coverage/`, `.expo/`, `*.ipa`, `*.apk`, `vendor/bundle/`, `.bundle/`, `DerivedDataCI/`, `TestResults.xcresult`.
+4. First commit: app sources + `.github/` + `fastlane/` + config; never commit `node_modules/`.
+5. If the developer pastes a **remote URL**, set `git remote` and push; on failure, fix auth and retry.

@@ -1,0 +1,129 @@
+paths:
+
+  exclude:
+    - build/
+    - Pods/
+    - node_modules/
+    - .gradle/
+    - DerivedData/
+
+rules:
+  
+  # Catch logging sensitive data
+  - id: mobile-log-sensitive-data
+    patterns:
+        # Match assignment in Java OR Swift
+        - pattern-either:
+            - pattern: |
+                Log.$METHOD($TAG, $DATA)
+            - pattern: |
+                print($DATA)
+        # Apply regex for sensitive data
+        - metavariable-regex:
+            metavariable: $VALUE
+            regex: '(?i)(AIza|sk_|AKIA|Bearer|token|secret|api[_-]?key)[A-Za-z0-9_\-]{8,}'
+    message: "Avoid logging sensitive data"
+    severity: ERROR
+    languages: [java, kotlin, swift]
+
+  # Catch hardcoding sensitive data
+  - id: mobile-hardcoded-secret
+    languages: [java, kotlin, swift]
+    severity: ERROR
+    message: "Possible hardcoded sensitive data"
+
+    patterns:
+      # ✅ Language-aware assignment
+      - pattern-either:
+          - pattern: |
+              let $VAR = $VALUE;
+          - pattern: |
+              var $VAR = $VALUE;
+          - pattern: |
+              String $VAR = $VALUE;
+
+      # Ensure string literal
+      - metavariable-pattern:
+          metavariable: $VALUE
+          pattern: "\"...\""
+
+      # Sensitive variable names
+      - metavariable-regex:
+          metavariable: $VAR
+          regex: '(?i)(token|secret|key|auth|password|client)'
+
+      # Sensitive value patterns
+      - metavariable-regex:
+          metavariable: $VALUE
+          regex: '(?i)(AIza|sk_|AKIA|Bearer|[0-9\-]+\.apps\.googleusercontent\.com|^[A-Za-z0-9_\-\/+=]{16,}$)'
+
+      # ❌ Exclusions
+      - pattern-not: |
+          let $VAR = Bundle.main.bundleIdentifier;
+
+      - pattern-not: |
+          let $VAR = "[0-9]{10,}";
+
+      - pattern-not: |
+          let $VAR = ".*==";
+
+  # Catch Insecure HTTP URL
+  - id: insecure-url
+    pattern: |
+      "http://..."
+    message: "Insecure HTTP URL detected"
+    severity: ERROR
+    languages: [java, kotlin, swift]
+
+  # Catch Insecure android webview
+  - id: android-insecure-webview
+    pattern: webView.getSettings().setJavaScriptEnabled(true)
+    message: "JavaScript enabled in WebView - validate input sources"
+    severity: WARNING
+    languages: [java, kotlin]
+
+  # -------------------------
+  # FIXED UserDefaults RULES
+  # -------------------------
+
+  # Rule 1: Suspicious KEY
+  - id: ios-userdefaults-sensitive-key
+    patterns:
+      - pattern: |
+          UserDefaults.standard.set($DATA, forKey: $KEY)
+
+      - metavariable-regex:
+          metavariable: $KEY
+          regex: '(?i)(token|password|secret|auth|session|key)'
+
+    message: "Sensitive key used in UserDefaults"
+    severity: WARNING
+    languages: [swift]
+
+  # Rule 2: Suspicious VARIABLE NAME
+  - id: ios-userdefaults-sensitive-data
+    patterns:
+      - pattern: |
+          UserDefaults.standard.set($DATA, forKey: $KEY)
+
+      - metavariable-regex:
+          metavariable: $DATA
+          regex: '(?i)(token|password|secret|auth|session|key)'
+
+    message: "Sensitive data stored in UserDefaults"
+    severity: WARNING
+    languages: [swift]
+
+  # Rule 3: Secret-like STRING value
+  - id: ios-userdefaults-hardcoded-secret
+    patterns:
+      - pattern: |
+          UserDefaults.standard.set($DATA, forKey: $KEY)
+
+      - metavariable-regex:
+          metavariable: $DATA
+          regex: '(?i)(AIza|sk_|AKIA|Bearer)[A-Za-z0-9_\-]{8,}'
+
+    message: "Hardcoded secret stored in UserDefaults"
+    severity: ERROR
+    languages: [swift]

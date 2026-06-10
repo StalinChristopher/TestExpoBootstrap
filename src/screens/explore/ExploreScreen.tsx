@@ -1,0 +1,62 @@
+import { DrawerActions } from "@react-navigation/native";
+import React from "react";
+import { useTranslation } from "react-i18next";
+import { View } from "react-native";
+
+import { AppButton } from "../../components/AppButton";
+import { AppText } from "../../components/AppText";
+import { TopBar } from "../../components/TopBar";
+import { APP_DISPLAY_NAME } from "../../config/appDisplayName";
+import { SpacingToken } from "../../designSystem/generated/spacing";
+import type { ExploreMainCompositeProps } from "../../navigation/screenTypes";
+import { useThemedStyles } from "../../theme/useThemedStyles";
+
+type Props = ExploreMainCompositeProps;
+
+export function ExploreScreen({ navigation }: Props) {
+  const { t } = useTranslation();
+  const styles = useThemedStyles(
+    colors => ({
+      root: { flex: 1, backgroundColor: colors.background },
+      container: {
+        flex: 1,
+        padding: SpacingToken.spacing_value_4,
+        gap: SpacingToken.spacing_value_2_5,
+        backgroundColor: colors.background,
+      },
+    }),
+    [],
+  );
+
+  return (
+    <View style={styles.root}>
+      <TopBar
+        topBarTitle={APP_DISPLAY_NAME}
+        onMenuPress={() => navigation.dispatch(DrawerActions.openDrawer())}
+      />
+      <View style={styles.container}>
+        <AppText variant="headingSm" color="text1">
+          {t("explore.title")}
+        </AppText>
+
+        <AppButton
+          label={t("explore.navigateDetail")}
+          variant="secondary"
+          onPress={() =>
+            navigation.navigate("ExploreDetail", { section: "news" })
+          }
+        />
+
+        <AppButton
+          label={t("explore.switchHome")}
+          variant="secondary"
+          onPress={() =>
+            navigation.navigate("HomeTab", {
+              screen: "HomeMain",
+            })
+          }
+        />
+      </View>
+    </View>
+  );
+}

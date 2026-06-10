@@ -1,0 +1,41 @@
+---
+description: GitHub Actions RN template — workflow map and path conventions
+alwaysApply: false
+---
+
+# React Native GitHub Actions
+
+## Orchestrators
+
+| Workflow | Role |
+|----------|------|
+| `rn.yml` | Main CI: JS lint/security/test → **`expo-native-dirs`** (Expo targets only) → **`android-dev` / `ios-dev`** (Gradle + Fastlane). **`android-perf`** after **`android-dev`**; **`ios-performance`** after **`ios-dev`**. Template repo uses unified orchestrator with **`detect`** (`expo` if `package.json` lists **`expo`**). Target repos get flavor-specific orchestrators from **`.github/workflow-orchestrators/`** via **`prune_workflows_for_flavor.py`**. |
+| `rn-internal-release.yml` | Manual Gradle + Fastlane internal release |
+| `rn-firebase-release.yml` | Manual Firebase: dispatch **`platform`** (`android-dev`, `android-dist`, `ios-dev`, `ios-dist`, `all`, …) |
+| `rn-performance-baseline.yml` | Records iOS perf baseline on `main` |
+| `rn-performance-pr.yml` | Manual re-run of iOS perf (PR path is `rn.yml` → `ios-performance`) |
+| `rn-code-health.yml` | Tech-debt / health scripts |
+| `codeql-rn.yml` | CodeQL JavaScript |
+
+## Workflow flavor pruning (kit apply)
+
+After `rsync`, run **`python3 .github/scripts/prune_workflows_for_flavor.py`**. Manifests: **`.github/workflow-manifests/`**. **`expo`** in `package.json` → **expo-committed** (~16 files); else **bare** (~21 files). Template keeps all ~27 workflows.
+
+## Reusable jobs (prefix `rn-job-`)
+
+- **JS:** `rn-job-js-lint.yml`, `rn-job-js-test.yml`, `rn-job-security.yml`
+- **Android:** `rn-job-android-firebase-release.yml`, `rn-job-android-internal-release.yml`, `rn-job-android-perf.yml` — **bare-only:** `rn-job-android-build-bare.yml`, `rn-job-android-debug-apk.yml`
+- **iOS:** `rn-job-ios-firebase-release.yml`, `rn-job-ios-internal-release.yml`, `rn-job-ios-performance.yml` — **bare-only:** `rn-job-ios-build-bare.yml`, `rn-job-ios-simulator-artifact.yml`, `rn-job-ios-test.yml`
+- **EAS (template only; pruned from targets):** `rn-job-*-expo*.yml`, `rn-job-expo-eas-build-and-distribute.yml`
+
+## Path rules
+
+- Run Gradle with `working-directory: android` or `cd android`; cache key `android/**/*.gradle*`.
+- Write `android/local.properties` with `sdk.dir=$ANDROID_HOME` after `setup-android`.
+- iOS: `bundle exec pod install --project-directory=ios`; use the **workspace** under `ios/` produced by your app’s prebuild (bootstrap / Fastlane names vary by repo).
+- **Xcode:** macOS iOS jobs pin **26.2** (Expo SDK 55 / EAS baseline). Do **not** override `DEVELOPER_DIR` to `/Applications/Xcode.app/...` when using `maxim-lobanov/setup-xcode`—that can mix toolchains and break Swift in `expo-modules-core`.
+- Node **20** everywhere for JS and pre-Gradle steps.
+
+## Reuse in another repository
+
+See **`docs/RN_WORKFLOW_REUSE.md`** — `rsync` kit, **`prune_workflows_for_flavor.py`**, `bootstrap_rn_workflow_ids.py`, `list_workflow_secrets.py`, and the one-shot prompt **`CURSOR_RN_DEVOPS_ONE_SHOT_APPLY.txt`**.

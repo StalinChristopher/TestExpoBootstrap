@@ -1,0 +1,170 @@
+name: RN Performance baseline (main)
+
+# Updates ci/performance-baseline.json + ci/performance-history.json when app code lands on main.
+# Does not trigger on commits that only touch ci/*.json (avoids bot loops).
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "ios/**"
+      - "src/**"
+      - "index.js"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/scripts/ci_run_ios_ui_performance_tests.sh"
+      - ".github/scripts/extract_performance_metrics.py"
+      - ".github/scripts/update_performance_history.py"
+      - ".github/workflows/rn-performance-baseline.yml"
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rn-performance-baseline-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  update-baseline:
+    name: Record iOS performance metrics on main
+    runs-on: ${{ vars.IOS_RUNNER || 'self-hosted' }}
+    timeout-minutes: 60
+    env:
+      XCODE_VERSION: "26.1.1"
+      PERF_METRICS_MODE: full
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore Firebase client config
+        uses: ./.github/actions/restore-firebase-client-config
+        with:
+          firebase_flavor: dev
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+          GOOGLE_SERVICE_INFO_PLIST_DEV: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST_DEV }}
+          GOOGLE_SERVICE_INFO_PLIST_DIST: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST_DIST }}
+          GOOGLE_SERVICE_INFO_PLIST: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - run: bash .github/scripts/install_js_deps.sh auto
+
+      - name: Restore CI env files
+        run: bash .github/scripts/restore_ci_env_files.sh
+
+      # Self-hosted runner: Xcode must be pre-installed at the version set in XCODE_VERSION.
+      # setup-xcode is intentionally omitted — it only works on GitHub-hosted runners.
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Configure Homebrew Ruby PATH
+        run: |
+          if BREW_RUBY="$(brew --prefix ruby 2>/dev/null)/bin" && [ -d "$BREW_RUBY" ]; then
+            echo "$BREW_RUBY" >> "$GITHUB_PATH"
+            echo "Using Homebrew Ruby at $BREW_RUBY: $("$BREW_RUBY/ruby" --version)"
+          else
+            echo "::warning::No Homebrew Ruby found — falling back to system Ruby $(ruby --version)"
+          fi
+
+      - run: bundle install
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ios/Pods
+            ~/Library/Caches/CocoaPods
+          key: pods-v2-${{ runner.os }}-${{ hashFiles('ios/Podfile.lock', 'ios/Podfile') }}
+
+      - name: pod install
+        run: bundle exec pod install --project-directory=ios
+
+      - name: Run UI performance tests
+        id: perf_tests
+        continue-on-error: true
+        timeout-minutes: 40
+        env:
+          PERF_METRICS_MODE: full
+          IOS_WORKSPACE: ios/TestExpoBootstrapDev.xcworkspace
+          IOS_SCHEME: TestExpoBootstrapDev
+          IOS_BUILD_CONFIGURATION: Debug
+        run: |
+          chmod +x .github/scripts/ci_run_ios_ui_performance_tests.sh
+          .github/scripts/ci_run_ios_ui_performance_tests.sh
+
+      - name: Extract & update CI JSON
+        if: steps.perf_tests.outcome != 'cancelled'
+        working-directory: ${{ github.workspace }}
+        run: |
+          python3 .github/scripts/extract_performance_metrics.py \
+            --xcresult build/TestResults.xcresult \
+            --xcodebuild-log build/xcodebuild-test.log \
+            --out build/current-metrics.json
+          # --preserve-on-empty (default) keeps the last good baseline when extraction
+          # produces empty metrics — mirrors the Android perf_baselines.json seed strategy.
+          python3 .github/scripts/update_performance_history.py \
+            --metrics build/current-metrics.json \
+            --baseline-out ci/performance-baseline.json \
+            --history-out ci/performance-history.json
+
+      - name: Validate baseline metrics
+        id: validate_metrics
+        working-directory: ${{ github.workspace }}
+        run: |
+          python3 << 'PY'
+          import json, os
+          from pathlib import Path
+
+          doc = json.loads(Path("build/current-metrics.json").read_text(encoding="utf-8"))
+          metrics = doc.get("metrics") or {}
+          n = len(metrics)
+          blobs = doc.get("rawPerformanceObjects", "?")
+          log_keys = doc.get("logMetricKeys", "?")
+          print(f"Extracted metrics: {n}, xcresult blobs: {blobs}, log-parsed keys: {log_keys}")
+
+          env_file = os.environ.get("GITHUB_OUTPUT", "")
+          if n > 0:
+              print(f"metrics_empty=false", flush=True)
+              if env_file:
+                  Path(env_file).open("a").write("metrics_empty=false\n")
+          else:
+              print("::warning::No metrics extracted — existing baseline preserved (seed values used for PR comparison until extraction works).")
+              print(f"metrics_empty=true", flush=True)
+              if env_file:
+                  Path(env_file).open("a").write("metrics_empty=true\n")
+          PY
+
+      - name: Upload xcresult (debug)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-xcresult-${{ github.run_id }}
+          path: build/TestResults.xcresult
+          if-no-files-found: ignore
+
+      - name: Upload xcodebuild log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-xcodebuild-log-${{ github.run_id }}
+          path: build/xcodebuild-test.log
+          if-no-files-found: ignore
+
+      - name: Commit baseline & history
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore(ci): update iOS performance baseline [skip ci]"
+          file_pattern: "ci/*.json"
+          commit_user_name: "github-actions[bot]"
+          commit_user_email: "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fail if performance tests failed
+        if: steps.perf_tests.outcome == 'failure'
+        run: |
+          echo "::error::Baseline UI performance tests failed — review logs; baseline may be partial."
+          exit 1

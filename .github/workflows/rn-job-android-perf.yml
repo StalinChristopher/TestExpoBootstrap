@@ -1,0 +1,794 @@
+# Reusable Android performance workflow for React Native (bare) projects.
+#
+# APK source — two modes:
+#   Artifact mode (preferred):  pass apk_artifact_name → downloads APK uploaded by a prior build job
+#                               (e.g. the signed-apk-firebase-dev artifact from android-dev).
+#                               Skips all Gradle/Node/Java/Firebase steps. Zero redundant builds.
+#   Self-build mode (fallback): leave apk_artifact_name empty → builds the APK inline.
+#                               Useful for standalone runs or when no upstream build job exists.
+#
+# Caller example using artifact mode (rn.yml):
+#
+#   android-perf:
+#     needs: [android-dev]
+#     if: needs.android-dev.result == 'success'
+#     uses: ./.github/workflows/rn-job-android-perf.yml
+#     with:
+#       package:            "com.example.myapp.dev"
+#       apk_artifact_name:  "signed-apk-firebase-dev-${{ github.run_number }}"
+#     secrets: inherit
+
+name: RN — Android performance (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      # ------------------------------------------------------------------
+      # Required
+      # ------------------------------------------------------------------
+      package:
+        description: "Android application ID (e.g. com.example.myapp.dev)"
+        required: true
+        type: string
+
+      # ------------------------------------------------------------------
+      # App identity
+      # ------------------------------------------------------------------
+      activity:
+        description: >
+          Fully-qualified launcher component (e.g. com.example.myapp/.MainActivity).
+          Omit to let the agent resolve it automatically via cmd package resolve-activity.
+        required: false
+        type: string
+        default: ""
+
+      # ------------------------------------------------------------------
+      # APK source
+      # ------------------------------------------------------------------
+      apk_artifact_name:
+        description: >
+          Name of an artifact uploaded by a prior job in this workflow run that contains
+          the APK (e.g. "signed-apk-firebase-dev-123"). When set, all Gradle build steps
+          are skipped and the APK is downloaded from the artifact store instead.
+          Leave empty to build the APK inline (self-build mode / standalone run).
+        required: false
+        type: string
+        default: ""
+
+      # ------------------------------------------------------------------
+      # Build (used only when apk_artifact_name is empty)
+      # ------------------------------------------------------------------
+      gradle_task:
+        description: >
+          Gradle task that produces the APK. devRelease uses the debug signing config
+          (no keystore secrets needed) and bundles JS in release/Hermes mode.
+        required: false
+        type: string
+        default: "assembleRelease"
+
+      gradle_project_dir:
+        description: "Subdirectory containing gradlew (relative to repo root)"
+        required: false
+        type: string
+        default: "android"
+
+      apk_glob:
+        description: "Shell glob matching the built APK, relative to the repo root"
+        required: false
+        type: string
+        default: "android/app/build/outputs/apk/release/*.apk"
+
+      node_version:
+        description: "Node.js version for the JS install step"
+        required: false
+        type: string
+        default: "20"
+
+      java_version:
+        description: "JDK version for the build step"
+        required: false
+        type: string
+        default: "17"
+
+      firebase_flavor:
+        description: >
+          Flavor passed to the restore-firebase-client-config action (dev or dist).
+          Set to empty string to skip config restoration when Firebase is not integrated.
+        required: false
+        type: string
+        default: "dev"
+
+      # ------------------------------------------------------------------
+      # Runner
+      # ------------------------------------------------------------------
+      runner:
+        description: >
+          GitHub Actions runner label(s). Use 'self-hosted' for a local Mac runner
+          (no cloud compute cost, hardware GPU, faster emulator boot). Use 'ubuntu-latest'
+          for a GitHub-hosted cloud runner (requires KVM, costs minutes, x86_64 only).
+        required: false
+        type: string
+        default: "self-hosted"
+
+      setup_java:
+        description: >
+          Install JDK via actions/setup-java. Set false on self-hosted runners that
+          already have a JDK on PATH to skip the download.
+        required: false
+        type: boolean
+        default: false
+
+      setup_python:
+        description: >
+          Install Python via actions/setup-python. Set false on self-hosted runners
+          that already have Python 3 on PATH.
+        required: false
+        type: boolean
+        default: false
+
+      setup_node:
+        description: >
+          Install Node.js via actions/setup-node. Set false on self-hosted runners
+          that already have a compatible Node version on PATH.
+        required: false
+        type: boolean
+        default: false
+
+      setup_android_sdk:
+        description: >
+          Install Android SDK via android-actions/setup-android. Set true for
+          cloud runners (ubuntu-latest). Set false for self-hosted runners that
+          already have the SDK installed.
+        required: false
+        type: boolean
+        default: false
+
+      android_sdk_path:
+        description: >
+          Absolute path to the Android SDK on self-hosted runners (optional).
+          If empty, the workflow auto-detects ANDROID_HOME, ANDROID_SDK_ROOT,
+          ~/Library/Android/sdk (macOS), ~/Android/Sdk, or /usr/local/lib/android/sdk.
+        required: false
+        type: string
+        default: ""
+
+      # ------------------------------------------------------------------
+      # Emulator
+      # ------------------------------------------------------------------
+      api_level:
+        description: "Android emulator API level"
+        required: false
+        type: number
+        default: 34
+
+      emulator_profile:
+        description: "AVD device profile (e.g. pixel_5)"
+        required: false
+        type: string
+        default: "pixel_5"
+
+      emulator_arch:
+        description: >
+          CPU architecture for the AVD image.
+          'arm64-v8a' — Apple Silicon self-hosted Mac runners (native ARM image).
+          'x86_64'    — GitHub-hosted Linux runners (KVM-accelerated).
+        required: false
+        type: string
+        default: "arm64-v8a"
+
+      emulator_gpu:
+        description: >
+          GPU rendering mode.
+          'auto'                 — macOS self-hosted runners (uses host GPU, accurate FPS).
+          'swiftshader_indirect' — headless Linux / cloud runners.
+        required: false
+        type: string
+        default: "auto"
+
+      prefer_connected_device:
+        description: >
+          When true (default), the job checks 'adb devices' before starting an emulator.
+          If any ADB device is already in the 'device' state (e.g. a USB-connected phone or
+          a pre-booted emulator), that device is used directly and the emulator boot is skipped.
+          Set to false to always start a fresh AVD regardless of connected devices.
+        required: false
+        type: boolean
+        default: true
+
+      # ------------------------------------------------------------------
+      # Measurement knobs
+      # ------------------------------------------------------------------
+      runs:
+        description: "Number of cold-launch iterations; median is used for the gate"
+        required: false
+        type: number
+        default: 5
+
+      scroll_seconds:
+        description: "Seconds of scripted scroll used for FPS / CPU measurement"
+        required: false
+        type: number
+        default: 6
+
+      cpu_samples:
+        description: "Number of CPU samples taken during the scroll window"
+        required: false
+        type: number
+        default: 10
+
+      leak_cycles:
+        description: "Number of background/foreground cycles for memory leak detection"
+        required: false
+        type: number
+        default: 5
+
+      thresholds_path:
+        description: "Repo-relative path to perf_thresholds.json (used only when baselines_path is empty)"
+        required: false
+        type: string
+        default: "scripts/perf/perf_thresholds.json"
+
+      baselines_path:
+        description: "Repo-relative path to perf_baselines.json — fallback when no main baseline exists on perf-data yet"
+        required: false
+        type: string
+        default: "scripts/perf/perf_baselines.json"
+
+      baseline_tolerance_pct:
+        description: "Relative tolerance (%) when generating gate baselines from main-perf-baseline.json"
+        required: false
+        type: number
+        default: 25
+
+      out_dir:
+        description: "Directory for perf-report.json, perf-report.md, and analysis.md"
+        required: false
+        type: string
+        default: "build/reports/perf"
+
+      soft:
+        description: "Set to true to always exit 0 on gate failures (report is still written)"
+        required: false
+        type: boolean
+        default: false
+
+      perfetto:
+        description: "Set to true to also capture a 10 s Perfetto system trace"
+        required: false
+        type: boolean
+        default: false
+
+      am_start_extras:
+        description: >
+          Extra flags appended to every 'adb shell am start' invocation.
+          Use to bypass auth screens so FPS/CPU measurements run against real UI.
+        required: false
+        type: string
+        default: ""
+
+      deep_link:
+        description: >
+          Deep link opened before FPS measurement (e.g. myapp://posts).
+          Requires a scrollable screen and Android intent filter; see docs/ANDROID_PERF_FPS_SETUP.md.
+        required: false
+        type: string
+        default: ""
+
+      perf_settle_seconds:
+        description: "Seconds to wait after deep link for API + list render before FPS scroll"
+        required: false
+        type: number
+        default: 10
+
+      # ------------------------------------------------------------------
+      # Regression detection
+      # ------------------------------------------------------------------
+      fail_on_regression:
+        description: >
+          Exit 1 if any metric regresses more than its regression threshold vs the
+          cached baseline (independent of hard gate failures).
+        required: false
+        type: boolean
+        default: false
+
+      artifact_retention_days:
+        description: "How many days to retain the uploaded performance report artifact"
+        required: false
+        type: number
+        default: 14
+
+      job_timeout_minutes:
+        description: >
+          Overall job timeout in minutes. Self-hosted macOS runners may need 20–30 min
+          to boot the emulator the first time (AVD creation + system image download).
+        required: false
+        type: number
+        default: 30
+
+    secrets:
+      GOOGLE_SERVICES_JSON:
+        required: false
+      GOOGLE_SERVICE_INFO_PLIST_DEV:
+        required: false
+      GOOGLE_SERVICE_INFO_PLIST_DIST:
+        required: false
+      GOOGLE_SERVICE_INFO_PLIST:
+        required: false
+
+jobs:
+  perf:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ inputs.job_timeout_minutes }}
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      # Full clone so git fetch origin perf-data reliably resolves the latest baseline.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure react-native-config env (self-build only)
+        if: inputs.apk_artifact_name == ''
+        run: bash .github/scripts/ensure_react_native_config_env.sh dev
+
+      # Last successful perf run on main stores its report as main-perf-baseline.json
+      # on the perf-data branch. PRs (and main self-check) gate and compare against it.
+      - name: Load baseline from last merge to main
+        id: main-baseline
+        run: |
+          set -euo pipefail
+          mkdir -p build/reports/perf-from-main build/reports/perf-baseline
+          git fetch origin perf-data 2>/dev/null || true
+          BASE_FILE="main-perf-baseline.json"
+          if git rev-parse --verify "origin/perf-data" >/dev/null 2>&1 \
+            && git cat-file -e "origin/perf-data:${BASE_FILE}" 2>/dev/null; then
+            git show "origin/perf-data:${BASE_FILE}" > build/reports/perf-from-main/main-perf-baseline.json
+            python3 scripts/perf/record_baselines.py \
+              --report build/reports/perf-from-main/main-perf-baseline.json \
+              --out build/reports/perf-from-main/dynamic_baselines.json \
+              --tolerance-pct ${{ inputs.baseline_tolerance_pct }}
+            cp build/reports/perf-from-main/main-perf-baseline.json \
+              build/reports/perf-baseline/perf-report.json
+            echo "has_main_baseline=true" >> "$GITHUB_OUTPUT"
+            echo "Using main-perf-baseline.json from perf-data branch."
+          else
+            echo "has_main_baseline=false" >> "$GITHUB_OUTPUT"
+            echo "No main baseline on perf-data yet — falling back to committed perf_baselines.json."
+          fi
+
+      # ── Artifact mode: download APK uploaded by the upstream build job ────────
+      # Runs only when apk_artifact_name is supplied. All Gradle/Node/Java steps
+      # below are skipped in this mode, eliminating the redundant build.
+      - name: Download APK artifact
+        if: inputs.apk_artifact_name != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.apk_artifact_name }}
+          path: downloaded-apk
+
+      # ── Self-build mode: install toolchain and build the APK inline ──────────
+      # All steps in this section are skipped when apk_artifact_name is set.
+
+      - name: Set up Node.js
+        if: inputs.setup_node && inputs.apk_artifact_name == ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+
+      - name: Set up JDK
+        if: inputs.setup_java && inputs.apk_artifact_name == ''
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java_version }}
+          distribution: temurin
+          cache: gradle
+
+      # Python is always needed (perf scripts run on the runner regardless of APK source).
+      - name: Set up Python
+        if: inputs.setup_python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Restore google-services.json so the Firebase plugin in build.gradle does not fail.
+      - name: Restore Firebase client config
+        if: inputs.firebase_flavor != '' && inputs.apk_artifact_name == ''
+        uses: ./.github/actions/restore-firebase-client-config
+        with:
+          firebase_flavor: ${{ inputs.firebase_flavor }}
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+          GOOGLE_SERVICE_INFO_PLIST_DEV: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST_DEV }}
+          GOOGLE_SERVICE_INFO_PLIST_DIST: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST_DIST }}
+          GOOGLE_SERVICE_INFO_PLIST: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST }}
+
+      # npm install required before Gradle because the RN Gradle plugin calls
+      # node_modules/.bin/react-native to bundle the JS at build time.
+      - name: Install JS dependencies
+        if: inputs.apk_artifact_name == ''
+        run: bash .github/scripts/install_js_deps.sh auto
+
+      # Install Android SDK via action (cloud runners only).
+      - name: Set up Android SDK (cloud runners)
+        if: inputs.setup_android_sdk && inputs.apk_artifact_name == ''
+        uses: android-actions/setup-android@v3
+
+      # Gradle requires sdk.dir in local.properties. Self-hosted Mac runners often
+      # run as a service without ANDROID_HOME in the environment, so we auto-detect.
+      - name: Configure Android SDK for Gradle
+        if: inputs.apk_artifact_name == ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK=""
+          INPUT_SDK='${{ inputs.android_sdk_path }}'
+          if [ -n "$INPUT_SDK" ] && [ -d "$INPUT_SDK" ]; then
+            SDK="$INPUT_SDK"
+          elif [ -n "${ANDROID_HOME:-}" ] && [ -d "$ANDROID_HOME" ]; then
+            SDK="$ANDROID_HOME"
+          elif [ -n "${ANDROID_SDK_ROOT:-}" ] && [ -d "$ANDROID_SDK_ROOT" ]; then
+            SDK="$ANDROID_SDK_ROOT"
+          elif [ -d "$HOME/Library/Android/sdk" ]; then
+            SDK="$HOME/Library/Android/sdk"
+          elif [ -d "$HOME/Android/Sdk" ]; then
+            SDK="$HOME/Android/Sdk"
+          elif [ -d "/usr/local/lib/android/sdk" ]; then
+            SDK="/usr/local/lib/android/sdk"
+          fi
+
+          if [ -z "$SDK" ]; then
+            echo "::error::Android SDK not found. On the runner Mac: install Android Studio or cmdline-tools," \
+              "then set ANDROID_HOME in ~/.zprofile for the runner user, or pass android_sdk_path." >&2
+            exit 1
+          fi
+
+          echo "Using Android SDK: $SDK"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          printf 'sdk.dir=%s\n' "$SDK" > "$GITHUB_WORKSPACE/${{ inputs.gradle_project_dir }}/local.properties"
+
+      - name: Cache Gradle
+        if: inputs.apk_artifact_name == ''
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-perf-${{ runner.os }}-${{ hashFiles('android/**/*.gradle*', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-perf-${{ runner.os }}-
+
+      - name: Build APK
+        if: inputs.apk_artifact_name == ''
+        working-directory: ${{ inputs.gradle_project_dir }}
+        run: |
+          chmod +x gradlew
+          ./gradlew ${{ inputs.gradle_task }} --no-daemon
+
+      # ── Resolve APK path (both modes) ────────────────────────────────────────
+      - name: Resolve APK path
+        id: apk
+        run: |
+          if [ -n "${{ inputs.apk_artifact_name }}" ]; then
+            APK_PATH=$(ls downloaded-apk/*.apk 2>/dev/null | head -n 1)
+            if [ -z "$APK_PATH" ]; then
+              echo "::error::No .apk found in downloaded-apk/ — artifact '${{ inputs.apk_artifact_name }}' may be empty or missing." >&2
+              exit 1
+            fi
+          else
+            APK_PATH=$(ls ${{ inputs.apk_glob }} 2>/dev/null | head -n 1)
+            if [ -z "$APK_PATH" ]; then
+              echo "::error::No APK matched glob '${{ inputs.apk_glob }}'" >&2
+              exit 1
+            fi
+          fi
+          echo "Resolved APK: $APK_PATH"
+          echo "path=$APK_PATH" >> "$GITHUB_OUTPUT"
+
+      # Cache the last perf-report for regression comparison when perf-data has no
+      # main baseline yet (first runs on new branches).
+      - name: Restore performance baseline (branch cache)
+        if: steps.main-baseline.outputs.has_main_baseline != 'true'
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: build/reports/perf-baseline
+          key: perf-baseline-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            perf-baseline-${{ github.ref_name }}-
+
+      - name: Build agent flags
+        id: flags
+        run: |
+          FLAGS="--package ${{ inputs.package }}"
+          if [ "${{ steps.main-baseline.outputs.has_main_baseline }}" = "true" ]; then
+            FLAGS="$FLAGS --baselines build/reports/perf-from-main/dynamic_baselines.json"
+          elif [ -n "${{ inputs.baselines_path }}" ]; then
+            FLAGS="$FLAGS --baselines ${{ inputs.baselines_path }}"
+          else
+            FLAGS="$FLAGS --thresholds ${{ inputs.thresholds_path }}"
+          fi
+          FLAGS="$FLAGS --runs ${{ inputs.runs }}"
+          FLAGS="$FLAGS --scroll-seconds ${{ inputs.scroll_seconds }}"
+          FLAGS="$FLAGS --cpu-samples ${{ inputs.cpu_samples }}"
+          FLAGS="$FLAGS --leak-cycles ${{ inputs.leak_cycles }}"
+          FLAGS="$FLAGS --out ${{ inputs.out_dir }}"
+          FLAGS="$FLAGS --apk ${{ steps.apk.outputs.path }}"
+          if [ -n "${{ inputs.activity }}" ]; then
+            FLAGS="$FLAGS --activity ${{ inputs.activity }}"
+          fi
+          if [ "${{ inputs.soft }}" = "true" ]; then
+            FLAGS="$FLAGS --soft"
+          fi
+          if [ "${{ inputs.perfetto }}" = "true" ]; then
+            FLAGS="$FLAGS --perfetto"
+          fi
+          if [ -n "${{ inputs.am_start_extras }}" ]; then
+            FLAGS="$FLAGS ${{ inputs.am_start_extras }}"
+          fi
+          if [ -n "${{ inputs.deep_link }}" ]; then
+            FLAGS="$FLAGS --deep-link ${{ inputs.deep_link }}"
+            FLAGS="$FLAGS --perf-settle-seconds ${{ inputs.perf_settle_seconds }}"
+          fi
+          echo "value=$FLAGS" >> "$GITHUB_OUTPUT"
+
+      # Prefer a device already visible to adb (physical phone, pre-booted emulator)
+      # so the emulator boot is skipped entirely on self-hosted runners.
+      - name: Detect connected ADB device
+        id: detect-device
+        run: |
+          set -euo pipefail
+          # Pick the first line after the header that shows a device in 'device' state.
+          SERIAL=$(adb devices 2>/dev/null | awk 'NR>1 && $2=="device" {print $1; exit}' || true)
+          if [ -n "$SERIAL" ]; then
+            echo "has_device=true"   >> "$GITHUB_OUTPUT"
+            echo "device_serial=$SERIAL" >> "$GITHUB_OUTPUT"
+            echo "Found connected ADB device: $SERIAL — emulator boot will be skipped."
+          else
+            echo "has_device=false"  >> "$GITHUB_OUTPUT"
+            echo "device_serial="    >> "$GITHUB_OUTPUT"
+            echo "No ready ADB device found — will start AVD emulator."
+          fi
+
+      # Fast path: use the already-connected device (physical phone or pre-booted emulator).
+      - name: Run performance agent on connected device
+        if: ${{ inputs.prefer_connected_device && steps.detect-device.outputs.has_device == 'true' }}
+        env:
+          ANDROID_SERIAL: ${{ steps.detect-device.outputs.device_serial }}
+        run: |
+          adb shell settings put global window_animation_scale 0.0
+          adb shell settings put global transition_animation_scale 0.0
+          adb shell settings put global animator_duration_scale 0.0
+          adb shell input keyevent 82
+          adb install -r -t "${{ steps.apk.outputs.path }}"
+          mkdir -p "${{ inputs.out_dir }}"
+          python3 scripts/perf/run_perf.py ${{ steps.flags.outputs.value }}
+
+      # Slow path: boot an AVD emulator when no device is available.
+      # KVM hardware acceleration is only available on Linux runners.
+      # macOS self-hosted runners use the Hypervisor framework natively.
+      - name: Enable KVM (Linux only)
+        if: ${{ runner.os == 'Linux' && (!inputs.prefer_connected_device || steps.detect-device.outputs.has_device != 'true') }}
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run performance agent on emulator
+        if: ${{ !inputs.prefer_connected_device || steps.detect-device.outputs.has_device != 'true' }}
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ inputs.api_level }}
+          arch: ${{ inputs.emulator_arch }}
+          profile: ${{ inputs.emulator_profile }}
+          target: google_apis
+          disable-animations: true
+          disable-spellchecker: true
+          force-avd-creation: true
+          emulator-options: >-
+            -no-window
+            -gpu ${{ inputs.emulator_gpu }}
+            -no-snapshot
+            -noaudio
+            -no-boot-anim
+            -camera-back none
+          script: |
+            adb shell settings put global window_animation_scale 0.0
+            adb shell settings put global transition_animation_scale 0.0
+            adb shell settings put global animator_duration_scale 0.0
+            adb shell input keyevent 82
+            adb install -r -t "${{ steps.apk.outputs.path }}"
+            mkdir -p "${{ inputs.out_dir }}"
+            python3 scripts/perf/run_perf.py ${{ steps.flags.outputs.value }}
+            # Explicitly shut down the emulator so android-emulator-runner exits
+            # immediately rather than hanging waiting for the process to die on its own.
+            adb emu kill || true
+            adb kill-server || true
+
+      # Always runs so we get a report even when the emulator step fails.
+      - name: Analyze performance + detect regressions
+        if: always()
+        run: |
+          REPORT="${{ inputs.out_dir }}/perf-report.json"
+          BASELINE="build/reports/perf-baseline/perf-report.json"
+          ANALYSIS_OUT="${{ inputs.out_dir }}/analysis.md"
+
+          ANALYZE_FLAGS="--report $REPORT --out $ANALYSIS_OUT"
+          if [ -f "$BASELINE" ]; then
+            echo "Baseline found — running regression comparison."
+            ANALYZE_FLAGS="$ANALYZE_FLAGS --baseline $BASELINE"
+          else
+            echo "No baseline found — first-run analysis only."
+          fi
+          if [ "${{ inputs.fail_on_regression }}" = "true" ]; then
+            ANALYZE_FLAGS="$ANALYZE_FLAGS --fail-on-regression"
+          fi
+
+          if [ -f "$REPORT" ]; then
+            python3 scripts/perf/analyze_perf.py $ANALYZE_FLAGS
+          else
+            echo "perf-report.json not found — skipping analysis (agent likely failed)."
+          fi
+
+      - name: Post results as PR comment
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const analysisPath = '${{ inputs.out_dir }}/analysis.md';
+            const reportPath   = '${{ inputs.out_dir }}/perf-report.json';
+
+            let body = '## 📊 Android Performance Results\n\n';
+            if (fs.existsSync(analysisPath)) {
+              body += fs.readFileSync(analysisPath, 'utf8');
+            } else if (fs.existsSync(reportPath)) {
+              body += '_Analysis not available. See uploaded artifact for the raw report._';
+            } else {
+              body += '_Performance report not generated — emulator or build likely failed._';
+            }
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c =>
+              c.user.login === 'github-actions[bot]' &&
+              c.body.startsWith('## 📊 Android Performance Results')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Upload performance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-performance-report
+          path: ${{ inputs.out_dir }}/**
+          if-no-files-found: warn
+          retention-days: ${{ inputs.artifact_retention_days }}
+
+      # Append this run's metrics to the append-only perf-trend.json on the
+      # perf-data branch so the dashboard can plot trends over time.
+      - name: Append to trend database
+        if: always()
+        run: |
+          REPORT="${{ inputs.out_dir }}/perf-report.json"
+          if [ ! -f "$REPORT" ]; then
+            echo "perf-report.json not found — skipping trend append."
+            exit 0
+          fi
+
+          APPEND_SCRIPT="$(mktemp)"
+          REPORT_TMP="$(mktemp)"
+          cp "$GITHUB_WORKSPACE/scripts/perf/append_trend.py" "$APPEND_SCRIPT"
+          cp "$GITHUB_WORKSPACE/$REPORT" "$REPORT_TMP"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin perf-data 2>/dev/null || true
+          if git show-ref --quiet refs/remotes/origin/perf-data; then
+            git checkout -b perf-data origin/perf-data
+          else
+            git checkout --orphan perf-data
+            git rm -rf . --quiet || true
+          fi
+
+          [ -f perf-trend.json ] || echo "[]" > perf-trend.json
+
+          python3 "$APPEND_SCRIPT" \
+            --report  "$REPORT_TMP" \
+            --trend   perf-trend.json \
+            --sha     "${{ github.sha }}" \
+            --branch  "${{ github.ref_name }}" \
+            --run-id  "${{ github.run_id }}"
+
+          # Pin the main baseline whenever a push to main produces real metrics.
+          # This must happen regardless of gate pass/fail to prevent a deadlock where
+          # the baseline never refreshes because it always fails the old stale gates.
+          if [ "${{ github.ref_name }}" = "main" ] \
+            && [ "${{ github.event_name }}" = "push" ] \
+            && [ -f "$REPORT_TMP" ] \
+            && python3 -c "import json,sys; r=json.load(open(sys.argv[1])); sys.exit(0 if len(r.get('metrics') or []) > 0 else 1)" "$REPORT_TMP"; then
+            cp "$REPORT_TMP" main-perf-baseline.json
+            git add main-perf-baseline.json
+          fi
+
+          rm -f "$APPEND_SCRIPT" "$REPORT_TMP"
+
+          git add perf-trend.json
+          git commit -m "perf: run ${{ github.run_id }} on ${{ github.ref_name }} [${{ github.sha }}]" || true
+          git push origin perf-data
+
+          git checkout "${{ github.sha }}" --quiet || true
+
+      # Rebuild the GitHub Pages performance dashboard from the full trend history.
+      # Enable Pages: repo Settings → Pages → Source: perf-data branch, /docs folder.
+      - name: Generate performance dashboard
+        if: always()
+        run: |
+          DASHBOARD_SCRIPT="$(mktemp)"
+          THRESHOLDS_TMP="$(mktemp)"
+          cp "$GITHUB_WORKSPACE/scripts/perf/generate_dashboard.py" "$DASHBOARD_SCRIPT"
+          cp "$GITHUB_WORKSPACE/scripts/perf/perf_thresholds.json"  "$THRESHOLDS_TMP"
+
+          git fetch origin perf-data 2>/dev/null || true
+          if git show-ref --quiet refs/remotes/origin/perf-data; then
+            git checkout perf-data 2>/dev/null || git checkout -b perf-data origin/perf-data
+          else
+            echo "perf-data branch not found — skipping dashboard generation."
+            rm -f "$DASHBOARD_SCRIPT" "$THRESHOLDS_TMP"
+            exit 0
+          fi
+
+          if [ ! -f perf-trend.json ]; then
+            echo "perf-trend.json not found on perf-data — skipping dashboard."
+            rm -f "$DASHBOARD_SCRIPT" "$THRESHOLDS_TMP"
+            exit 0
+          fi
+
+          mkdir -p docs
+          python3 "$DASHBOARD_SCRIPT" \
+            --trend      perf-trend.json \
+            --thresholds "$THRESHOLDS_TMP" \
+            --out        docs/index.html \
+            --title      "RN Android Performance"
+
+          rm -f "$DASHBOARD_SCRIPT" "$THRESHOLDS_TMP"
+
+          git add docs/index.html
+          git commit -m "perf: update dashboard run ${{ github.run_id }}" || true
+          git push origin perf-data
+
+          git checkout "${{ github.sha }}" --quiet || true
+
+      - name: Save performance baseline (branch cache)
+        if: success()
+        run: |
+          mkdir -p build/reports/perf-baseline
+          cp "${{ inputs.out_dir }}/perf-report.json" build/reports/perf-baseline/perf-report.json
+      - name: Save performance baseline cache
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: build/reports/perf-baseline
+          key: perf-baseline-${{ github.ref_name }}-${{ github.run_id }}

@@ -1,0 +1,16 @@
+{
+  "android": [
+    "google-services.json",
+    "android/app/google-services.json"
+  ],
+  "ios": {
+    "dev": [
+      "GoogleService-Info.plist",
+      "ios/TestExpoBootstrapDev/GoogleService-Info.plist"
+    ],
+    "dist": [
+      "GoogleService-Info.plist",
+      "ios/TestExpoBootstrapDev/GoogleService-Info.plist"
+    ]
+  }
+}

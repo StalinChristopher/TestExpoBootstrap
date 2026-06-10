@@ -1,0 +1,236 @@
+# Signed release APK → GitHub artifact, optional Play Internal App Sharing, Slack only after successful ISS upload.
+# Invoked from android.yml (manual internal release, or PR path after CI).
+
+name: RN — Android internal signed release
+
+on:
+  workflow_call:
+    inputs:
+      branch:
+        description: Git branch or ref to build
+        required: true
+        type: string
+      release_notes:
+        required: false
+        type: string
+        default: ""
+      gradle_task:
+        required: false
+        type: string
+        default: assembleRelease
+      gradle_project_dir:
+        required: false
+        type: string
+        default: "android"
+      artifact_glob:
+        required: false
+        type: string
+        default: app/build/outputs/apk/release/*.apk
+      dry_run:
+        required: false
+        type: boolean
+        default: false
+      upload_to_play:
+        description: Upload APK to Play Internal App Sharing (requires PLAY_SERVICE_ACCOUNT_JSON)
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    env:
+      GRADLE_DIR: ${{ inputs.gradle_project_dir }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 0
+
+      - name: Restore Firebase client config
+        uses: ./.github/actions/restore-firebase-client-config
+        with:
+          firebase_flavor: ${{ contains(inputs.gradle_task, 'Dev') && 'dev' || 'dist' }}
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+          GOOGLE_SERVICE_INFO_PLIST_DEV: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST_DEV }}
+          GOOGLE_SERVICE_INFO_PLIST_DIST: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST_DIST }}
+          GOOGLE_SERVICE_INFO_PLIST: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST }}
+
+      - name: Resolve and validate package name
+        run: |
+          set -euo pipefail
+          TASK="${{ inputs.gradle_task }}"
+          BUILD_GRADLE="${{ inputs.gradle_project_dir }}/app/build.gradle"
+
+          if [ ! -f "$BUILD_GRADLE" ]; then
+            echo "::error::Missing ${BUILD_GRADLE}. Set gradle_project_dir if the app module lives elsewhere."
+            exit 1
+          fi
+
+          # Derive flavor: assembleDevRelease → dev, assembleProdRelease → prod
+          FLAVOR=$(echo "$TASK" | sed 's/^assemble//;s/Release$//;s/Debug$//' | tr '[:upper:]' '[:lower:]')
+
+          # POSIX-friendly: Ubuntu default awk (mawk) does not support \b / \s used in earlier patterns.
+          extract_application_id_block() {
+            local block_label="$1"
+            local in_block=0
+            local line
+            # Expo prebuild often uses single quotes; RN templates may use double quotes.
+            local re_aid_dq='applicationId[[:space:]]*"([^"]+)"'
+            local re_aid_sq="applicationId[[:space:]]*'([^']+)'"
+            while IFS= read -r line || [ -n "$line" ]; do
+              if [[ "$in_block" -eq 0 ]] && [[ "$line" =~ ^[[:space:]]*${block_label}[[:space:]]*\{ ]]; then
+                in_block=1
+                continue
+              fi
+              if [[ "$in_block" -eq 1 ]]; then
+                if [[ "$line" =~ $re_aid_dq ]] || [[ "$line" =~ $re_aid_sq ]]; then
+                  printf '%s' "${BASH_REMATCH[1]}"
+                  return 0
+                fi
+                if [[ "$line" =~ ^[[:space:]]*\}[[:space:]]*$ ]]; then
+                  return 1
+                fi
+              fi
+            done < "$BUILD_GRADLE"
+            return 1
+          }
+
+          APP_ID=$(extract_application_id_block "$FLAVOR" || true)
+          if [ -z "$APP_ID" ]; then
+            APP_ID=$(extract_application_id_block "defaultConfig" || true)
+          fi
+
+          if [ -z "$APP_ID" ]; then
+            echo "::error::Could not resolve applicationId for flavor '${FLAVOR}' from ${BUILD_GRADLE}. Add applicationId under that productFlavor or in defaultConfig."
+            exit 1
+          fi
+
+          echo "PACKAGE_NAME=$APP_ID" >> "$GITHUB_ENV"
+          echo "Resolved PACKAGE_NAME=$APP_ID (flavor: $FLAVOR)"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install JS dependencies
+        run: bash .github/scripts/install_js_deps.sh auto
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Write Android local.properties
+        run: echo "sdk.dir=$ANDROID_HOME" > android/local.properties
+
+      - name: Cache Gradle
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/**/*.gradle*', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Decode release keystore
+        run: |
+          echo "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" | base64 -d > "${RUNNER_TEMP}/release.keystore"
+          chmod 600 "${RUNNER_TEMP}/release.keystore"
+
+      - name: Build signed release APK
+        working-directory: ${{ env.GRADLE_DIR }}
+        env:
+          CI_VERSION_CODE: ${{ github.run_number }}
+          RELEASE_KEYSTORE_PATH: ${{ format('{0}/release.keystore', runner.temp) }}
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: ./gradlew ${{ inputs.gradle_task }} --no-daemon --stacktrace
+
+      - name: Resolve APK and metadata
+        id: artifact
+        working-directory: ${{ env.GRADLE_DIR }}
+        run: |
+          shopt -s nullglob
+          matches=( ${{ inputs.artifact_glob }} )
+          if [ ${#matches[@]} -eq 0 ]; then
+            echo "::error::No APK matched ${{ inputs.artifact_glob }} under ${{ env.GRADLE_DIR }}"
+            exit 1
+          fi
+          APK="${matches[0]}"
+          echo "artifact_path=$APK" >> "$GITHUB_OUTPUT"
+          echo "artifact_abs=$(pwd)/$APK" >> "$GITHUB_OUTPUT"
+          META_DIR=$(dirname "$APK")
+          if [ -f "$META_DIR/output-metadata.json" ]; then
+            echo "version_name=$(jq -r '.elements[0].versionName // empty' "$META_DIR/output-metadata.json")" >> "$GITHUB_OUTPUT"
+            echo "version_code=$(jq -r '.elements[0].versionCode // empty' "$META_DIR/output-metadata.json")" >> "$GITHUB_OUTPUT"
+          else
+            echo "version_name=" >> "$GITHUB_OUTPUT"
+            echo "version_code=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload APK to workflow artifacts
+        id: upload_apk
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-apk-${{ github.run_number }}
+          path: ${{ steps.artifact.outputs.artifact_abs }}
+          if-no-files-found: error
+
+      - name: Upload to Play Internal App Sharing
+        id: upload_play
+        if: ${{ inputs.dry_run == false && inputs.upload_to_play }}
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: ${{ env.PACKAGE_NAME }}
+          releaseFiles: ${{ steps.artifact.outputs.artifact_abs }}
+          track: internalsharing
+          status: completed
+
+      - name: Notify Slack (workflow webhook)
+        if: ${{ inputs.dry_run == false && inputs.upload_to_play && steps.upload_play.outcome == 'success' }}
+        env:
+          SLACK_TRIGGER_WEBHOOK_URL: ${{ secrets.SLACK_TRIGGER_WEBHOOK_URL }}
+          BUILD_PLATFORM: android
+          BUILD_FLAVOR: ${{ contains(inputs.gradle_task, 'Dev') && 'dev' || 'dist' }}
+          BUILD_CHANNEL: play-internal
+          BUILD_VERSION_NAME: ${{ steps.artifact.outputs.version_name }}
+          BUILD_VERSION_CODE: ${{ steps.artifact.outputs.version_code }}
+          BUILD_GRADLE_TASK: ${{ inputs.gradle_task }}
+          BUILD_REF: ${{ inputs.branch }}
+          BUILD_WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BUILD_ARTIFACT_NAME: signed-apk-${{ github.run_number }}
+          BUILD_ARTIFACT_URL: ${{ steps.upload_apk.outputs.artifact-url }}
+          BUILD_RELEASE_NOTES: ${{ inputs.release_notes }}
+          BUILD_INTERNAL_SHARING_URL: ${{ steps.upload_play.outputs.internalSharingDownloadUrl }}
+        run: bash "${GITHUB_WORKSPACE}/.github/scripts/notify_slack_workflow_webhook.sh"
+
+      - name: Build summary
+        if: ${{ inputs.dry_run == false && success() }}
+        run: |
+          echo "APK built at ${{ steps.artifact.outputs.artifact_abs }}"
+          echo "version_name=${{ steps.artifact.outputs.version_name }}"
+          echo "version_code=${{ steps.artifact.outputs.version_code }}"
+          echo "Download: this run's Artifacts → signed-apk-${{ github.run_number }} (ZIP contains the APK)."
+
+      - name: Dry run summary
+        if: ${{ inputs.dry_run && success() }}
+        run: |
+          echo "Dry run: APK built at ${{ steps.artifact.outputs.artifact_abs }}"
+          echo "version_name=${{ steps.artifact.outputs.version_name }}"
+          echo "version_code=${{ steps.artifact.outputs.version_code }}"
+          echo "Download: this run's Artifacts → signed-apk-${{ github.run_number }} (ZIP contains the APK)."

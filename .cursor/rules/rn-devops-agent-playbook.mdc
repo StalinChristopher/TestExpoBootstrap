@@ -1,0 +1,38 @@
+---
+description: Ordered steps for Git, RN CI, EAS, and Fastlane in this template
+alwaysApply: false
+---
+
+# React Native DevOps playbook (agent order)
+
+## 0. Reuse
+
+- In an **app** repo, when the user says e.g. "apply the RN DevOps kit" with **`PATH: /absolute/.../template-pipeline-react-native`** (or **`TEMPLATE_ROOT=`**), prefer **`rn-devops-apply-kit`** and [`docs/RN_WORKFLOW_REUSE.md`](docs/RN_WORKFLOW_REUSE.md) **Recommended (minimal)**.
+- Copy **infrastructure** from this template (`.github/`, `.semgrep/`, `.cursor/rules/`, `fastlane/`, `eas.json` patterns) with `rsync` per `SETUP_RN_DEVOPS_KIT.md`.
+- **Gradle** lives in `android/`; **iOS** always uses `ios/*.xcworkspace` after `pod install`.
+- **Ruby 3.1** + `bundle install` for CocoaPods and Fastlane on macOS jobs.
+- **After rsync into another repo:** run `python3 .github/scripts/bootstrap_rn_workflow_ids.py` and `python3 .github/scripts/list_workflow_secrets.py --write GITHUB_SECRETS_CHECKLIST.md` (see `docs/RN_WORKFLOW_REUSE.md`).
+
+## 1. Git
+
+- Init at app root, branch `main`, respect `GITIGNORE_APPEND.txt` and root `.gitignore`.
+- When the developer provides a **remote URL**, add `origin` and `git push -u origin main` (or current branch) after commits exist. On auth failure, help fix credentials and retry.
+
+## 2. Build modes
+
+- **`bare`**: `package.json` does not list **`expo`** (or `workflow_dispatch` override) — Gradle in `android/`, Fastlane `gym` with workspace in `ios/`.
+- **`expo`**: `package.json` lists **`expo`** — same Gradle + Fastlane **`android-dev` / `ios-dev`** as bare; **committed** `android/` + `ios/` from local **`expo prebuild`** (see `expo-native-dirs` in `rn.yml`). No `EXPO_TOKEN` for that orchestrator.
+- **EAS elsewhere:** optional workflows (e.g. internal release) may still use **`EXPO_TOKEN`** and `eas.json` for submit/cloud builds.
+- Orchestrator: `.github/workflows/rn.yml` (`detect` job + conditional jobs).
+
+## 3. Secrets (high level)
+
+- **EAS (optional workflows only):** `EXPO_TOKEN` — not used by default **`rn.yml`** when `detect` = `expo` (runner-only builds).
+- **Bare iOS:** App Store Connect API key, distribution cert/profile (see `rn-job-ios-build-bare.yml`).
+- **Bare Android release / Play:** keystore and Play service account (see `rn-job-android-internal-release.yml`).
+- Do not conflate **Git remote** with **store signing** in handoffs.
+
+## 4. After green CI
+
+- Android: see `rn-ci-artifact-simulator.mdc` (APK) for local install.
+- iOS: default `rn.yml` does not upload a simulator `.app`. If you wire `rn-job-ios-simulator-artifact.yml` (or otherwise obtain a Debug sim `.app`), unzip and `xcrun simctl install` per `rn-ci-artifact-simulator.mdc`.

@@ -1,0 +1,26 @@
+name: Restore Firebase client config
+description: Write google-services.json and GoogleService-Info.plist from repository secrets before native builds.
+
+inputs:
+  firebase_flavor:
+    description: "dev or dist — selects iOS plist secret (Android uses GOOGLE_SERVICES_JSON for all flavors)"
+    required: false
+    default: dev
+  paths_file:
+    description: Path to firebase-client-paths.json (default .github/firebase-client-paths.json)
+    required: false
+    default: .github/firebase-client-paths.json
+
+runs:
+  using: composite
+  steps:
+    - name: Restore Firebase client config
+      shell: bash
+      env:
+        FIREBASE_FLAVOR: ${{ inputs.firebase_flavor }}
+        FIREBASE_CLIENT_PATHS_FILE: ${{ inputs.paths_file }}
+        GOOGLE_SERVICES_JSON: ${{ env.GOOGLE_SERVICES_JSON }}
+        GOOGLE_SERVICE_INFO_PLIST_DEV: ${{ env.GOOGLE_SERVICE_INFO_PLIST_DEV }}
+        GOOGLE_SERVICE_INFO_PLIST_DIST: ${{ env.GOOGLE_SERVICE_INFO_PLIST_DIST }}
+        GOOGLE_SERVICE_INFO_PLIST: ${{ env.GOOGLE_SERVICE_INFO_PLIST }}
+      run: bash "${GITHUB_WORKSPACE}/.github/scripts/restore_firebase_client_config.sh"

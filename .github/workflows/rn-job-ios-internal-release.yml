@@ -1,0 +1,233 @@
+# Fastlane gym + optional TestFlight upload (CocoaPods workspace).
+name: RN — iOS internal release (Fastlane)
+
+on:
+  workflow_call:
+    inputs:
+      branch:
+        description: Git branch or ref to build
+        required: true
+        type: string
+      dry_run:
+        type: boolean
+        default: false
+      upload_to_testflight:
+        description: After gym, run upload_to_testflight_ipa
+        type: boolean
+        default: true
+      app_identifier:
+        description: "iOS bundle ID for bare Fastlane (must match Xcode and provisioning profile)"
+        type: string
+        required: false
+        default: com.codeandtheory.templatepipelinetest
+      ios_scheme:
+        description: "Xcode scheme used by Fastlane gym"
+        type: string
+        required: false
+        default: TestExpoBootstrapDev
+      app_name:
+        description: "App Store Connect app name (must be globally unique). Used by `produce` to create the app on first upload."
+        type: string
+        required: false
+        default: Template Pipeline React Native
+      app_primary_language:
+        description: "Primary language for the App Store Connect app record (e.g. en-US)."
+        type: string
+        required: false
+        default: en-US
+      app_sku:
+        description: "App Store Connect SKU. Any unique string; defaults to the bundle ID when blank."
+        type: string
+        required: false
+        default: ""
+    secrets:
+      APP_STORE_CONNECT_KEY_ID:
+        required: true
+      APP_STORE_CONNECT_ISSUER_ID:
+        required: true
+      APP_STORE_CONNECT_API_KEY:
+        required: true
+      DIST_CERTIFICATE_BASE64:
+        required: true
+      DIST_CERTIFICATE_PASSWORD:
+        required: true
+      DIST_PROFILE_BASE64:
+        required: true
+      IOS_CODESIGN_IDENTITY:
+        required: false
+      APP_COMPANY_NAME:
+        required: false
+
+env:
+  # Expo SDK 55 requires Xcode 26+; EAS defaults to 26.2. Same pin for bare + Expo iOS jobs.
+  XCODE_VERSION: "26.2"
+
+jobs:
+  release:
+    runs-on: macos-15
+    env:
+      APP_IDENTIFIER: ${{ inputs.app_identifier }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 0
+      - name: Restore Firebase client config
+        uses: ./.github/actions/restore-firebase-client-config
+        with:
+          firebase_flavor: dist
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+          GOOGLE_SERVICE_INFO_PLIST_DEV: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST_DEV }}
+          GOOGLE_SERVICE_INFO_PLIST_DIST: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST_DIST }}
+          GOOGLE_SERVICE_INFO_PLIST: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: bash .github/scripts/install_js_deps.sh auto
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "26.2"
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.1"
+          bundler: "2.4.12"
+      - name: Bundle (root Gemfile for CocoaPods + fastlane)
+        run: bundle install
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ios/Pods
+            ~/Library/Caches/CocoaPods
+          key: pods-${{ runner.os }}-${{ hashFiles('ios/Podfile.lock', 'ios/Podfile') }}
+      - name: pod install
+        run: bundle exec pod install --project-directory=ios
+      - name: Install cert + profile
+        env:
+          DIST_CERTIFICATE_BASE64: ${{ secrets.DIST_CERTIFICATE_BASE64 }}
+          DIST_CERTIFICATE_PASSWORD: ${{ secrets.DIST_CERTIFICATE_PASSWORD }}
+          DIST_PROFILE_BASE64: ${{ secrets.DIST_PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PASSWORD=temppassword
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          CERT_PATH="$RUNNER_TEMP/distribution.p12"
+          printf '%s' "$DIST_CERTIFICATE_BASE64" | /usr/bin/base64 -D > "$CERT_PATH"
+          security import "$CERT_PATH" -P "$DIST_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          PROFILE_PATH="$RUNNER_TEMP/appstore.mobileprovision"
+          printf '%s' "$DIST_PROFILE_BASE64" | /usr/bin/base64 -D > "$PROFILE_PATH"
+          security cms -D -i "$PROFILE_PATH" > "$RUNNER_TEMP/profile.plist"
+          UUID=$(/usr/libexec/PlistBuddy -c 'Print UUID' "$RUNNER_TEMP/profile.plist")
+          PROFILE_NAME=$(/usr/libexec/PlistBuddy -c 'Print Name' "$RUNNER_TEMP/profile.plist")
+          TEAM_ID=$(/usr/libexec/PlistBuddy -c 'Print TeamIdentifier:0' "$RUNNER_TEMP/profile.plist")
+          APP_ID_FULL=$(/usr/libexec/PlistBuddy -c 'Print Entitlements:application-identifier' "$RUNNER_TEMP/profile.plist")
+          PROFILE_BUNDLE="${APP_ID_FULL#${TEAM_ID}.}"
+          EXPECTED_BUNDLE="${APP_IDENTIFIER:-}"
+          if [ -n "$EXPECTED_BUNDLE" ] && [ "$PROFILE_BUNDLE" != "$EXPECTED_BUNDLE" ]; then
+            echo "::error::Provisioning profile App ID \"${PROFILE_BUNDLE}\" does not match APP_IDENTIFIER \"${EXPECTED_BUNDLE}\". Regenerate DIST_PROFILE_BASE64 for the correct bundle ID in Apple Developer."
+            exit 1
+          fi
+          # Fail fast if the imported distribution certificate is not embedded in the
+          # provisioning profile. Apple pins the allowed signing certs in the profile's
+          # DeveloperCertificates array; a mismatch otherwise surfaces ~15 min into the
+          # archive as "Provisioning profile ... doesn't include signing certificate ...".
+          CERT_SHA1=$(openssl pkcs12 -in "$CERT_PATH" -passin pass:"$DIST_CERTIFICATE_PASSWORD" -nokeys -clcerts 2>/dev/null \
+            | openssl x509 -noout -fingerprint -sha1 2>/dev/null \
+            | sed 's/.*=//; s/://g' | tr '[:lower:]' '[:upper:]')
+          if [ -n "$CERT_SHA1" ]; then
+            PROFILE_CERTS_PARSED=0
+            PROFILE_HAS_CERT=0
+            i=0
+            while CERT_DER_B64=$(plutil -extract "DeveloperCertificates.$i" raw -o - "$RUNNER_TEMP/profile.plist" 2>/dev/null); do
+              PROFILE_CERT_SHA1=$(printf '%s' "$CERT_DER_B64" | /usr/bin/base64 -D 2>/dev/null \
+                | openssl x509 -inform DER -noout -fingerprint -sha1 2>/dev/null \
+                | sed 's/.*=//; s/://g' | tr '[:lower:]' '[:upper:]')
+              if [ -n "$PROFILE_CERT_SHA1" ]; then
+                PROFILE_CERTS_PARSED=$((PROFILE_CERTS_PARSED + 1))
+                if [ "$PROFILE_CERT_SHA1" = "$CERT_SHA1" ]; then
+                  PROFILE_HAS_CERT=1
+                  break
+                fi
+              fi
+              i=$((i + 1))
+            done
+            if [ "$PROFILE_CERTS_PARSED" -gt 0 ] && [ "$PROFILE_HAS_CERT" -ne 1 ]; then
+              echo "::error::Distribution certificate (SHA-1 ${CERT_SHA1}) is not included in provisioning profile \"${PROFILE_NAME}\". DIST_CERTIFICATE_BASE64 and DIST_PROFILE_BASE64 must reference the SAME Apple Distribution certificate. In Apple Developer, regenerate the App Store provisioning profile so it includes this certificate, then update the DIST_PROFILE_BASE64 secret (re-export DIST_CERTIFICATE_BASE64 from the same .p12 if you rotated the cert)."
+              exit 1
+            fi
+            if [ "$PROFILE_HAS_CERT" -eq 1 ]; then
+              echo "Verified distribution certificate ${CERT_SHA1} is included in profile \"${PROFILE_NAME}\"."
+            else
+              echo "::warning::Could not introspect DeveloperCertificates in the profile; skipping cert/profile match check."
+            fi
+          fi
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp "$PROFILE_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/"$UUID.mobileprovision"
+          echo "IOS_PROVISIONING_PROFILE_NAME<<EOF" >> $GITHUB_ENV
+          echo "$PROFILE_NAME" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          echo "APPLE_TEAM_ID=$TEAM_ID" >> $GITHUB_ENV
+      - name: fastlane staging_build
+        id: gym
+        env:
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+          APP_IDENTIFIER: ${{ inputs.app_identifier }}
+          IOS_SCHEME: ${{ inputs.ios_scheme }}
+          IOS_BUILD_CONFIGURATION: Release
+          IOS_CODESIGN_IDENTITY: ${{ secrets.IOS_CODESIGN_IDENTITY }}
+        run: bundle exec fastlane staging_build
+      - name: Print gym build log tail (on failure)
+        if: failure() && steps.gym.outcome == 'failure'
+        run: |
+          echo "=== Searching for gym log files ==="
+          find "$GITHUB_WORKSPACE/build/gym-logs" "$HOME/Library/Logs/gym" \
+            -name "*.log" 2>/dev/null || true
+          LOG=$(find "$GITHUB_WORKSPACE/build/gym-logs" "$HOME/Library/Logs/gym" \
+            -name "*.log" 2>/dev/null | head -1 || true)
+          if [ -n "$LOG" ]; then
+            echo "--- Last 500 lines of $LOG ---"
+            tail -n 500 "$LOG"
+          else
+            echo "No gym log file found — raw xcodebuild output is in the fastlane step above (disable_xcpretty: true)."
+          fi
+      - name: Upload gym build log (on failure)
+        if: failure() && steps.gym.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: gym-build-log-${{ github.run_number }}
+          path: |
+            build/gym-logs/
+            ~/Library/Logs/gym/
+          if-no-files-found: ignore
+          retention-days: 3
+      - name: fastlane upload_testflight_ipa
+        if: ${{ inputs.dry_run == false && inputs.upload_to_testflight }}
+        env:
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+          APP_IDENTIFIER: ${{ inputs.app_identifier }}
+          APP_NAME: ${{ inputs.app_name }}
+          APP_PRIMARY_LANGUAGE: ${{ inputs.app_primary_language }}
+          APP_SKU: ${{ inputs.app_sku }}
+          APP_COMPANY_NAME: ${{ secrets.APP_COMPANY_NAME }}
+        run: |
+          IPA_PATH="$GITHUB_WORKSPACE/build/TestExpoBootstrapDev.ipa"
+          bundle exec fastlane upload_testflight_ipa "ipa:$IPA_PATH"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-testexpobootstrap-staging-ipa
+          path: build/TestExpoBootstrapDev.ipa
+          if-no-files-found: warn
+      - name: Cleanup keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" || true

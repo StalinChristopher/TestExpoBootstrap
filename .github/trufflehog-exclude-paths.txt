@@ -1,0 +1,5 @@
+# GitHub Actions stores the ephemeral checkout token in .git/config — not repo secrets.
+\.git/
+node_modules/
+Pods/
+vendor/bundle/

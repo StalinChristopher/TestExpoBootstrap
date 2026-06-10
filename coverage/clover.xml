@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<coverage generated="1780039431415" clover="3.2.0">
+  <project timestamp="1780039431415" name="All files">
+    <metrics statements="5" coveredstatements="5" conditionals="2" coveredconditionals="1" methods="1" coveredmethods="1" elements="8" coveredelements="7" complexity="0" loc="5" ncloc="5" packages="3" files="4" classes="4"/>
+    <package name="query">
+      <metrics statements="1" coveredstatements="1" conditionals="0" coveredconditionals="0" methods="0" coveredmethods="0"/>
+      <file name="queryClient.ts" path="/Users/stalinchristopherdsouza/Documents/react-native-projects/ct-react-native-template/templates/ExpoTemplate/src/query/queryClient.ts">
+        <metrics statements="1" coveredstatements="1" conditionals="0" coveredconditionals="0" methods="0" coveredmethods="0"/>
+        <line num="3" count="1" type="stmt"/>
+      </file>
+    </package>
+    <package name="theme">
+      <metrics statements="0" coveredstatements="0" conditionals="0" coveredconditionals="0" methods="0" coveredmethods="0"/>
+      <file name="AppColors.ts" path="/Users/stalinchristopherdsouza/Documents/react-native-projects/ct-react-native-template/templates/ExpoTemplate/src/theme/AppColors.ts">
+        <metrics statements="0" coveredstatements="0" conditionals="0" coveredconditionals="0" methods="0" coveredmethods="0"/>
+      </file>
+    </package>
+    <package name="third-party.i18n">
+      <metrics statements="4" coveredstatements="4" conditionals="2" coveredconditionals="1" methods="1" coveredmethods="1"/>
+      <file name="getDeviceLanguageTag.ts" path="/Users/stalinchristopherdsouza/Documents/react-native-projects/ct-react-native-template/templates/ExpoTemplate/src/third-party/i18n/getDeviceLanguageTag.ts">
+        <metrics statements="2" coveredstatements="2" conditionals="2" coveredconditionals="1" methods="1" coveredmethods="1"/>
+        <line num="4" count="1" type="stmt"/>
+        <line num="5" count="1" type="cond" truecount="1" falsecount="1"/>
+      </file>
+      <file name="i18n.ts" path="/Users/stalinchristopherdsouza/Documents/react-native-projects/ct-react-native-template/templates/ExpoTemplate/src/third-party/i18n/i18n.ts">
+        <metrics statements="2" coveredstatements="2" conditionals="0" coveredconditionals="0" methods="0" coveredmethods="0"/>
+        <line num="11" count="1" type="stmt"/>
+        <line num="25" count="1" type="stmt"/>
+      </file>
+    </package>
+  </project>
+</coverage>

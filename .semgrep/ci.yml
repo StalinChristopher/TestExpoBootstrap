@@ -1,0 +1,10 @@
+configs:
+  - .semgrep/mobile.yml
+
+rules:
+  - id: blocker-http-usage
+    pattern: |
+      "http://..."
+    message: "Blocking HTTP usage in production"
+    severity: ERROR
+    languages: [java, kotlin, swift]

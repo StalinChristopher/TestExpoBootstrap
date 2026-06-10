@@ -1,0 +1,328 @@
+# Fastlane gym + Firebase App Distribution. App Store Connect API secrets optional — omit so staging_build skips TestFlight build-number bump.
+name: RN — iOS Firebase release (Fastlane)
+
+on:
+  workflow_call:
+    inputs:
+      branch:
+        description: Git branch or ref to build
+        required: true
+        type: string
+      firebase_ios_app:
+        description: "Which Firebase iOS app to upload (dist = release bundle ID, dev = dev bundle ID)"
+        type: string
+        required: true
+      dry_run:
+        type: boolean
+        default: false
+      upload_to_firebase:
+        description: Upload IPA to Firebase App Distribution
+        type: boolean
+        default: true
+      app_identifier:
+        description: "iOS bundle ID (must match Xcode, signing profile, and Firebase iOS app)"
+        type: string
+        required: false
+        default: com.codeandtheory.templatepipelinetest
+      ios_scheme:
+        description: "Xcode scheme used by Fastlane gym"
+        type: string
+        required: false
+        default: TestExpoBootstrapDev
+      ios_build_configuration_dev:
+        description: "Xcode build configuration for dev Firebase builds (CT flavor default Debug)"
+        type: string
+        required: false
+        default: Debug
+      ios_build_configuration_dist:
+        description: "Xcode build configuration for dist Firebase builds (CT flavor default Release)"
+        type: string
+        required: false
+        default: Release
+      firebase_groups:
+        description: Comma-separated Firebase App Distribution tester groups
+        type: string
+        required: false
+        default: internal-qa
+      release_notes:
+        required: false
+        type: string
+        default: ""
+      ios_workspace:
+        description: "Path to the .xcworkspace (relative to repo root)"
+        type: string
+        required: false
+        default: ios/TestExpoBootstrapDev.xcworkspace
+      produce_test_products:
+        description: >
+          After the main Fastlane build, also run xcodebuild build-for-testing for the
+          iphonesimulator SDK and upload the test products as an artifact named
+          ios-test-products-<run_number>. The iOS performance job can download this
+          artifact to skip its own build-for-testing phase, saving 5–10 min of cloud compute.
+          Only meaningful when firebase_ios_app == 'dev' (simulator target uses Debug).
+        type: boolean
+        required: false
+        default: false
+    secrets:
+      # Dist (release bundle ID)
+      DIST_CERTIFICATE_BASE64:
+        required: true
+      DIST_CERTIFICATE_PASSWORD:
+        required: true
+      DIST_PROFILE_BASE64:
+        required: true
+      # Dev bundle ID (when inputs.firebase_ios_app == dev)
+      DIST_CERTIFICATE_DEV_BASE64:
+        required: false
+      DIST_CERTIFICATE_DEV_PASSWORD:
+        required: false
+      DIST_PROFILE_DEV_BASE64:
+        required: false
+      FIREBASE_IOS_APP_ID:
+        required: true
+      FIREBASE_IOS_DEV_APP_ID:
+        required: true
+      FIREBASE_SERVICE_ACCOUNT_JSON:
+        required: true
+      IOS_CODESIGN_IDENTITY:
+        required: false
+      SLACK_TRIGGER_WEBHOOK_URL:
+        required: false
+
+env:
+  # Expo SDK 55 requires Xcode 26+; EAS defaults to 26.2. Same pin for bare + Expo iOS jobs.
+  XCODE_VERSION: "26.2"
+
+jobs:
+  release:
+    runs-on: macos-15
+    env:
+      APP_IDENTIFIER: ${{ inputs.app_identifier }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 0
+      - name: Restore Firebase client config
+        uses: ./.github/actions/restore-firebase-client-config
+        with:
+          firebase_flavor: ${{ inputs.firebase_ios_app }}
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+          GOOGLE_SERVICE_INFO_PLIST_DEV: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST_DEV }}
+          GOOGLE_SERVICE_INFO_PLIST_DIST: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST_DIST }}
+          GOOGLE_SERVICE_INFO_PLIST: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: bash .github/scripts/install_js_deps.sh auto
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "26.2"
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.2"
+          bundler: "2.4.12"
+      - name: Bundle (root Gemfile for CocoaPods + fastlane)
+        run: bundle install
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ios/Pods
+            ~/Library/Caches/CocoaPods
+          key: pods-v2-${{ runner.os }}-${{ hashFiles('ios/Podfile.lock', 'ios/Podfile') }}
+          restore-keys: |
+            pods-v2-${{ runner.os }}-
+      - name: pod install
+        run: bundle exec pod install --project-directory=ios
+      - name: Install cert + profile
+        env:
+          FIREBASE_IOS_APP: ${{ inputs.firebase_ios_app }}
+          DIST_CERTIFICATE_BASE64: ${{ secrets.DIST_CERTIFICATE_BASE64 }}
+          DIST_CERTIFICATE_PASSWORD: ${{ secrets.DIST_CERTIFICATE_PASSWORD }}
+          DIST_PROFILE_BASE64: ${{ secrets.DIST_PROFILE_BASE64 }}
+          DIST_CERTIFICATE_DEV_BASE64: ${{ secrets.DIST_CERTIFICATE_DEV_BASE64 }}
+          DIST_CERTIFICATE_DEV_PASSWORD: ${{ secrets.DIST_CERTIFICATE_DEV_PASSWORD }}
+          DIST_PROFILE_DEV_BASE64: ${{ secrets.DIST_PROFILE_DEV_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ "$FIREBASE_IOS_APP" = "dev" ]; then
+            if [ -z "${DIST_CERTIFICATE_DEV_BASE64:-}" ] || [ -z "${DIST_CERTIFICATE_DEV_PASSWORD:-}" ] || [ -z "${DIST_PROFILE_DEV_BASE64:-}" ]; then
+              echo "::error::Dev iOS signing requires repository secrets: DIST_CERTIFICATE_DEV_BASE64, DIST_CERTIFICATE_DEV_PASSWORD, DIST_PROFILE_DEV_BASE64"
+              exit 1
+            fi
+            DIST_CERTIFICATE_BASE64="$DIST_CERTIFICATE_DEV_BASE64"
+            DIST_CERTIFICATE_PASSWORD="$DIST_CERTIFICATE_DEV_PASSWORD"
+            DIST_PROFILE_BASE64="$DIST_PROFILE_DEV_BASE64"
+          fi
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PASSWORD=temppassword
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          CERT_PATH="$RUNNER_TEMP/distribution.p12"
+          printf '%s' "$DIST_CERTIFICATE_BASE64" | /usr/bin/base64 -D > "$CERT_PATH"
+          security import "$CERT_PATH" -P "$DIST_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          PROFILE_PATH="$RUNNER_TEMP/appstore.mobileprovision"
+          printf '%s' "$DIST_PROFILE_BASE64" | /usr/bin/base64 -D > "$PROFILE_PATH"
+          security cms -D -i "$PROFILE_PATH" > "$RUNNER_TEMP/profile.plist"
+          UUID=$(/usr/libexec/PlistBuddy -c 'Print UUID' "$RUNNER_TEMP/profile.plist")
+          PROFILE_NAME=$(/usr/libexec/PlistBuddy -c 'Print Name' "$RUNNER_TEMP/profile.plist")
+          TEAM_ID=$(/usr/libexec/PlistBuddy -c 'Print TeamIdentifier:0' "$RUNNER_TEMP/profile.plist")
+          APP_ID_FULL=$(/usr/libexec/PlistBuddy -c 'Print Entitlements:application-identifier' "$RUNNER_TEMP/profile.plist")
+          PROFILE_BUNDLE="${APP_ID_FULL#${TEAM_ID}.}"
+          EXPECTED_BUNDLE="${APP_IDENTIFIER:-}"
+          if [ -n "$EXPECTED_BUNDLE" ] && [ "$PROFILE_BUNDLE" != "$EXPECTED_BUNDLE" ]; then
+            echo "::error::Provisioning profile App ID \"${PROFILE_BUNDLE}\" does not match APP_IDENTIFIER \"${EXPECTED_BUNDLE}\". Regenerate DIST_PROFILE_BASE64 (or dev profile) for the correct bundle ID in Apple Developer."
+            exit 1
+          fi
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp "$PROFILE_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/"$UUID.mobileprovision"
+          echo "IOS_PROVISIONING_PROFILE_NAME<<EOF" >> $GITHUB_ENV
+          echo "$PROFILE_NAME" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+          echo "APPLE_TEAM_ID=$TEAM_ID" >> $GITHUB_ENV
+      - name: fastlane staging_build
+        env:
+          APP_IDENTIFIER: ${{ inputs.app_identifier }}
+          IOS_SCHEME: ${{ inputs.ios_scheme }}
+          IOS_CODESIGN_IDENTITY: ${{ secrets.IOS_CODESIGN_IDENTITY }}
+          IOS_BUILD_CONFIGURATION: ${{ inputs.firebase_ios_app == 'dev' && inputs.ios_build_configuration_dev || inputs.ios_build_configuration_dist }}
+          # Dev Firebase: Ad Hoc profile + ad-hoc export. Dist: App Store profile + app-store export.
+          IOS_EXPORT_METHOD: ${{ inputs.firebase_ios_app == 'dev' && 'development' || 'app-store' }}
+        run: bundle exec fastlane staging_build
+      # ── Optional: build-for-testing (simulator test products) ──────────────────
+      # Runs only when produce_test_products=true. Produces the DerivedData test
+      # products needed by the iOS performance job so it can skip its own build phase.
+      # Uses the same workspace/scheme already set up by Fastlane above.
+      # continue-on-error so a test-build failure never blocks the IPA upload.
+      - name: Build for testing (simulator test products)
+        id: build_for_testing
+        if: ${{ inputs.produce_test_products == true }}
+        continue-on-error: true
+        env:
+          IOS_WORKSPACE: ${{ inputs.ios_workspace }}
+          IOS_SCHEME: ${{ inputs.ios_scheme }}
+          IOS_BUILD_CONFIGURATION: ${{ inputs.firebase_ios_app == 'dev' && inputs.ios_build_configuration_dev || inputs.ios_build_configuration_dist }}
+          DD: ${{ github.workspace }}/DerivedDataCI
+        run: |
+          set -euo pipefail
+          DEST=$(python3 .github/scripts/ios_first_iphone_sim_udid.py)
+          echo "Building for simulator testing: scheme=$IOS_SCHEME config=$IOS_BUILD_CONFIGURATION dest=$DEST"
+          # Extract GOOGLE_APP_ID from the plist so the Crashlytics run-script gets it
+          # from the build environment (required even when GOOGLE_SERVICE_INFO_PLIST_DEV
+          # secret is not set — placeholder value satisfies the format check).
+          IOS_PLIST="ios/TestExpoBootstrapDev/GoogleService-Info.plist"
+          GOOGLE_APP_ID_VALUE=""
+          if [[ -f "${IOS_PLIST}" ]]; then
+            GOOGLE_APP_ID_VALUE=$(/usr/libexec/PlistBuddy -c 'Print :GOOGLE_APP_ID' "${IOS_PLIST}" 2>/dev/null || true)
+          fi
+          if [[ -z "${GOOGLE_APP_ID_VALUE}" ]]; then
+            echo "::warning::GOOGLE_APP_ID not found in ${IOS_PLIST} — Crashlytics build phase may fail. Set GOOGLE_SERVICE_INFO_PLIST_DEV secret."
+          fi
+          # Always provide GOOGLE_APP_ID — empty value causes FirebaseCrashlytics
+          # run-script to exit non-zero → xcodebuild exit code 65.
+          if [[ -z "${GOOGLE_APP_ID_VALUE}" ]]; then
+            GOOGLE_APP_ID_VALUE="1:000000000000:ios:0000000000000000000000"
+            echo "::notice::GOOGLE_APP_ID not found in plist — using CI placeholder."
+          fi
+          xcodebuild build-for-testing \
+            -workspace "$IOS_WORKSPACE" \
+            -scheme "$IOS_SCHEME" \
+            -configuration "$IOS_BUILD_CONFIGURATION" \
+            -sdk iphonesimulator \
+            -destination "$DEST" \
+            -derivedDataPath "$DD" \
+            CODE_SIGN_IDENTITY=- \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=YES \
+            FORCE_BUNDLING=1 \
+            EXCLUDED_ARCHS= \
+            GCC_TREAT_WARNINGS_AS_ERRORS=NO \
+            SWIFT_TREAT_WARNINGS_AS_ERRORS=NO \
+            DEBUG_INFORMATION_FORMAT=dwarf \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            CLANG_ENABLE_MODULE_DEBUGGING=NO \
+            GOOGLE_APP_ID="${GOOGLE_APP_ID_VALUE}" \
+            2>&1 | tee build/xcodebuild-for-testing.log
+          echo "build_for_testing completed successfully"
+
+      - name: Upload test products artifact
+        if: ${{ inputs.produce_test_products == true && steps.build_for_testing.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-test-products-${{ github.run_number }}
+          path: DerivedDataCI/Build/Products
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Upload build-for-testing log (debug)
+        if: ${{ inputs.produce_test_products == true && steps.build_for_testing.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-dev-build-for-testing-log-${{ github.run_number }}
+          path: build/xcodebuild-for-testing.log
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Read iOS version from Info.plist
+        id: ios_version
+        if: ${{ inputs.dry_run == false && inputs.upload_to_firebase }}
+        run: |
+          set -euo pipefail
+          PLIST="ios/TestExpoBootstrapDev/Info.plist"
+          if [ ! -f "$PLIST" ]; then
+            echo "::error::Missing $PLIST"
+            exit 1
+          fi
+          echo "version_name=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$PLIST")" >> "$GITHUB_OUTPUT"
+          echo "build_number=$(/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' "$PLIST")" >> "$GITHUB_OUTPUT"
+
+      # Docker-based Firebase actions do not run on macOS runners; use Firebase CLI.
+      - name: Upload IPA to Firebase App Distribution
+        id: upload_firebase
+        if: ${{ inputs.dry_run == false && inputs.upload_to_firebase }}
+        env:
+          FIREBASE_APP_ID: ${{ inputs.firebase_ios_app == 'dist' && secrets.FIREBASE_IOS_APP_ID || secrets.FIREBASE_IOS_DEV_APP_ID }}
+          SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          GROUPS: ${{ inputs.firebase_groups }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$SERVICE_ACCOUNT_JSON" > "$RUNNER_TEMP/firebase-sa.json"
+          chmod 600 "$RUNNER_TEMP/firebase-sa.json"
+          export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/firebase-sa.json"
+          export DISTRIBUTE_FILE="build/TestExpoBootstrapDev.ipa"
+          bash "${GITHUB_WORKSPACE}/.github/scripts/firebase_appdistribution_distribute.sh"
+      - name: Upload IPA to workflow artifacts
+        id: upload_ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-firebase-${{ inputs.firebase_ios_app }}-${{ github.run_number }}
+          path: build/TestExpoBootstrapDev.ipa
+          if-no-files-found: warn
+      - name: Notify Slack (workflow webhook)
+        if: ${{ inputs.dry_run == false && inputs.upload_to_firebase && steps.upload_firebase.outcome == 'success' }}
+        env:
+          SLACK_TRIGGER_WEBHOOK_URL: ${{ secrets.SLACK_TRIGGER_WEBHOOK_URL }}
+          BUILD_PLATFORM: ios
+          BUILD_FLAVOR: ${{ inputs.firebase_ios_app }}
+          BUILD_CHANNEL: firebase
+          BUILD_VERSION_NAME: ${{ steps.ios_version.outputs.version_name }}
+          BUILD_BUILD_NUMBER: ${{ steps.ios_version.outputs.build_number }}
+          BUILD_IOS_SCHEME: ${{ inputs.ios_scheme }}
+          BUILD_REF: ${{ inputs.branch }}
+          BUILD_WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BUILD_ARTIFACT_NAME: ios-firebase-${{ inputs.firebase_ios_app }}-${{ github.run_number }}
+          BUILD_ARTIFACT_URL: ${{ steps.upload_ipa.outputs.artifact-url }}
+          BUILD_RELEASE_NOTES: ${{ inputs.release_notes }}
+          BUILD_APP_DISTRIBUTION_TESTING_URL: ${{ steps.upload_firebase.outputs.testing_uri }}
+          BUILD_APP_DISTRIBUTION_CONSOLE_URL: ${{ steps.upload_firebase.outputs.firebase_console_uri }}
+        run: bash "${GITHUB_WORKSPACE}/.github/scripts/notify_slack_workflow_webhook.sh"
+      - name: Cleanup keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" || true

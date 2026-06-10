@@ -1,0 +1,98 @@
+# Manual Firebase App Distribution — Expo committed native (installed by prune_workflows_for_flavor.py).
+name: RN — Firebase release
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "Android: android-dev, android-dist, android-both | iOS: ios-dev, ios-dist, ios-both | all = every variant"
+        type: choice
+        options: [android-dev, android-dist, android-both, ios-dev, ios-dist, ios-both, all]
+        default: all
+      branch:
+        description: "Git branch or ref to build (e.g. main)"
+        required: true
+        type: string
+      release_notes:
+        description: Release notes for Firebase testers (optional)
+        required: false
+        type: string
+        default: ""
+      firebase_groups:
+        description: Comma-separated Firebase App Distribution tester groups
+        required: false
+        type: string
+        default: internal-qa
+      dry_run:
+        description: Build and upload artifact only; skip Firebase and Slack
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: rn-firebase-${{ github.repository }}-${{ inputs.branch }}
+  cancel-in-progress: false
+
+jobs:
+  expo-native-dirs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+      - name: Assert committed native dirs for Expo
+        run: bash .github/scripts/assert_expo_native_dirs.sh expo
+
+  android-firebase-dist:
+    needs: [expo-native-dirs]
+    if: inputs.platform == 'android-dist' || inputs.platform == 'android-both' || inputs.platform == 'all'
+    uses: ./.github/workflows/rn-job-android-firebase-release.yml
+    with:
+      branch: ${{ inputs.branch }}
+      firebase_android_app: dist
+      release_notes: ${{ inputs.release_notes }}
+      dry_run: ${{ inputs.dry_run }}
+      firebase_groups: ${{ inputs.firebase_groups }}
+    secrets: inherit
+
+  android-firebase-dev:
+    needs: [expo-native-dirs]
+    if: inputs.platform == 'android-dev' || inputs.platform == 'android-both' || inputs.platform == 'all'
+    uses: ./.github/workflows/rn-job-android-firebase-release.yml
+    with:
+      branch: ${{ inputs.branch }}
+      firebase_android_app: dev
+      gradle_task: assembleRelease
+      artifact_glob: app/build/outputs/apk/release/*.apk
+      release_notes: ${{ inputs.release_notes }}
+      dry_run: ${{ inputs.dry_run }}
+      firebase_groups: ${{ inputs.firebase_groups }}
+    secrets: inherit
+
+  ios-firebase-dist:
+    needs: [expo-native-dirs]
+    if: inputs.platform == 'ios-dist' || inputs.platform == 'ios-both' || inputs.platform == 'all'
+    uses: ./.github/workflows/rn-job-ios-firebase-release.yml
+    with:
+      branch: ${{ inputs.branch }}
+      firebase_ios_app: dist
+      app_identifier: com.codeandtheory.templatepipelinetest
+      ios_scheme: TestExpoBootstrapDev
+      dry_run: ${{ inputs.dry_run }}
+      firebase_groups: ${{ inputs.firebase_groups }}
+      release_notes: ${{ inputs.release_notes }}
+    secrets: inherit
+
+  ios-firebase-dev:
+    needs: [expo-native-dirs]
+    if: inputs.platform == 'ios-dev' || inputs.platform == 'ios-both' || inputs.platform == 'all'
+    uses: ./.github/workflows/rn-job-ios-firebase-release.yml
+    with:
+      branch: ${{ inputs.branch }}
+      firebase_ios_app: dev
+      app_identifier: com.codeandtheory.templatepipelinetest.dev
+      ios_scheme: TestExpoBootstrapDev
+      dry_run: ${{ inputs.dry_run }}
+      firebase_groups: ${{ inputs.firebase_groups }}
+      release_notes: ${{ inputs.release_notes }}
+    secrets: inherit

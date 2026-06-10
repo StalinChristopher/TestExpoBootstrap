@@ -1,0 +1,335 @@
+# iOS UI performance tests (XCTest metrics) + baseline comparison on PRs.
+# Invoked from rn.yml after ios-dev (gates on successful dev IPA build).
+#
+# Build strategy: always builds its own fresh simulator .app via build-for-testing.
+# Does NOT download pre-built test products from ios-dev — that path caused cascading
+# failures when ios-dev's build-for-testing exited with code 65 (Crashlytics run-script
+# or stale pod artifacts) and left no artifact to download, causing ios-performance to
+# also fail with 65 and produce empty PR metrics.
+#
+# Key fixes applied to the build-for-testing call (in ci_run_ios_ui_performance_tests.sh):
+#   DEBUG_INFORMATION_FORMAT=dwarf    — prevents dSYM generation; Crashlytics skips upload
+#   COMPILER_INDEX_STORE_ENABLE=NO    — faster build, avoids index-store locks
+#   CLANG_ENABLE_MODULE_DEBUGGING=NO  — avoids stale module cache conflicts
+#   GOOGLE_APP_ID fallback            — prevents Crashlytics from failing on empty plist
+#   DerivedData cleaned before build  — equivalent to local "delete DerivedData" fix
+#   pod install --clean-install       — equivalent to local "delete Pods + pod update" fix
+#
+# Runner modes:
+#   self-hosted (default): local Mac with Xcode + simulators pre-installed.
+#   macos-15 (cloud):      GitHub-hosted macOS runner (setup_xcode=true).
+name: RN — iOS UI performance
+
+on:
+  workflow_call:
+    inputs:
+      ios_workspace:
+        type: string
+        default: ios/TestExpoBootstrapDev.xcworkspace
+      ios_scheme:
+        type: string
+        default: TestExpoBootstrapDev
+      ios_build_configuration:
+        type: string
+        default: Debug
+        description: Must match the build configuration used in ios-dev (Debug)
+      simulator_destination:
+        type: string
+        default: auto
+      perf_metrics_mode:
+        type: string
+        default: full
+        description: full (launch + CPU/memory) or launch (smoke)
+      ios_performance_test_target:
+        type: string
+        default: ""
+        description: Optional override for -only-testing (empty = use perf_metrics_mode)
+      pr_number:
+        type: string
+        default: ""
+        description: PR number for posting the metrics comment (pass from caller on pull_request)
+      # ── Runner ────────────────────────────────────────────────────────────
+      runner:
+        type: string
+        default: "macos-15"
+        description: >
+          GitHub Actions runner label. Use 'self-hosted' (or a custom label like 'ios-perf')
+          for a local Mac runner (no cloud compute cost, Xcode + simulators pre-installed).
+          Use 'macos-15' for a GitHub-hosted cloud runner.
+      setup_xcode:
+        type: boolean
+        default: true
+        description: >
+          Install Xcode via maxim-lobanov/setup-xcode. Set false on self-hosted runners
+          that already have the required Xcode version on PATH.
+      setup_node:
+        type: boolean
+        default: true
+        description: >
+          Install Node.js via actions/setup-node. Set false on self-hosted runners
+          that already have a compatible Node version on PATH.
+      setup_ruby:
+        type: boolean
+        default: true
+        description: >
+          Install Ruby via ruby/setup-ruby. Set false on self-hosted runners that
+          already have a compatible Ruby + Bundler version on PATH (avoids conflicts
+          with the system Ruby). bundle install still runs regardless so CocoaPods
+          gem versions from the Gemfile are honoured.
+      job_timeout_minutes:
+        type: number
+        default: 60
+        description: >
+          Overall job timeout in minutes. Increased to 60 to account for the fresh
+          build-for-testing step (--clean-install pods + full compile from scratch).
+
+env:
+  XCODE_VERSION: "26.2"
+  PERF_REGRESSION_THRESHOLD: "0.12"
+  PERF_FAIL_ON_REGRESSION: "false"
+  PERF_REGRESSION_GATE_SUBSTRINGS: "applaunch"
+
+jobs:
+  ui-performance:
+    name: iOS UI performance vs baseline
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ inputs.job_timeout_minutes }}
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      IOS_WORKSPACE: ${{ inputs.ios_workspace }}
+      IOS_SCHEME: ${{ inputs.ios_scheme }}
+      IOS_BUILD_CONFIGURATION: ${{ inputs.ios_build_configuration }}
+      SIMULATOR_DESTINATION: ${{ inputs.simulator_destination }}
+      PERF_METRICS_MODE: ${{ inputs.perf_metrics_mode }}
+      PR_NUMBER: ${{ inputs.pr_number }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore Firebase client config
+        uses: ./.github/actions/restore-firebase-client-config
+        with:
+          firebase_flavor: dev
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+          GOOGLE_SERVICE_INFO_PLIST_DEV: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST_DEV }}
+          GOOGLE_SERVICE_INFO_PLIST_DIST: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST_DIST }}
+          GOOGLE_SERVICE_INFO_PLIST: ${{ secrets.GOOGLE_SERVICE_INFO_PLIST }}
+
+      # ── Toolchain setup ───────────────────────────────────────────────────────
+      # The ios-performance job always builds its own fresh simulator .app
+      # (build-for-testing). It no longer downloads ios-dev test products because
+      # that step produced a cascading failure: ios-dev's build-for-testing also
+      # exits with code 65, no artifact is uploaded, ios-performance cannot find
+      # it, falls back to inline build which also exits 65 → empty PR metrics.
+      - name: Set up Node.js
+        if: ${{ inputs.setup_node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install JS dependencies
+        run: bash .github/scripts/install_js_deps.sh auto
+
+      - name: Restore CI env files
+        run: bash .github/scripts/restore_ci_env_files.sh
+
+      - name: Set up Xcode
+        if: ${{ inputs.setup_xcode }}
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: ${{ env.XCODE_VERSION }}
+
+      # Cloud runners: install a pinned Ruby + bundler via the action.
+      - name: Set up Ruby + Bundler
+        if: ${{ inputs.setup_ruby }}
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.2"
+          bundler: "2.4.12"
+
+      # Self-hosted runners: system macOS Ruby (2.6) is read-only.
+      - name: Configure Ruby PATH (self-hosted)
+        if: ${{ !inputs.setup_ruby }}
+        run: |
+          if BREW_RUBY="$(brew --prefix ruby 2>/dev/null)/bin" && [ -d "$BREW_RUBY" ]; then
+            echo "$BREW_RUBY" >> "$GITHUB_PATH"
+            echo "Using Homebrew Ruby at $BREW_RUBY: $("$BREW_RUBY/ruby" --version)"
+          elif command -v rbenv &>/dev/null; then
+            rbenv_bin="$(rbenv prefix 2>/dev/null)/bin"
+            [ -d "$rbenv_bin" ] && echo "$rbenv_bin" >> "$GITHUB_PATH"
+            echo "Using rbenv Ruby: $(rbenv version)"
+          else
+            echo "::warning::No Homebrew/rbenv Ruby found — falling back to system Ruby $(ruby --version). bundler install may fail."
+          fi
+
+      - name: bundle install
+        run: |
+          BUNDLER_VERSION=$(grep -A1 "BUNDLED WITH" Gemfile.lock 2>/dev/null | tail -1 | tr -d ' ' || echo "")
+          if [ -n "$BUNDLER_VERSION" ]; then
+            gem install bundler:"$BUNDLER_VERSION" --no-document 2>/dev/null \
+              || gem install bundler:"$BUNDLER_VERSION" --user-install --no-document 2>/dev/null \
+              || echo "::warning::Could not install bundler $BUNDLER_VERSION — trying bundle install with current bundler"
+          fi
+          bundle install
+
+      # Cache pod source files keyed on Xcode version so a new Xcode release
+      # busts the cache and prevents stale pre-compiled pod artifacts that cause
+      # exit code 65 (the same issue the local 'delete Pods + pod update' fix resolves).
+      - name: Cache CocoaPods
+        uses: actions/cache@v4
+        with:
+          path: ios/Pods
+          key: pods-perf-${{ runner.os }}-xcode${{ env.XCODE_VERSION }}-${{ hashFiles('ios/Podfile.lock', 'ios/Podfile') }}
+          restore-keys: |
+            pods-perf-${{ runner.os }}-xcode${{ env.XCODE_VERSION }}-
+
+      # --clean-install removes stale pod build artifacts before reinstalling.
+      # This is the CI equivalent of 'delete Pods folder + pod update' that fixes
+      # exit code 65 locally. Adds ~2 min but prevents cascading build failures.
+      - name: pod install
+        run: bundle exec pod install --clean-install --project-directory=ios
+
+      # ── Baseline loading ──────────────────────────────────────────────────
+      # Reads ci/performance-baseline.json from origin/main.
+      # Baseline strategy (mirrors Android perf_baselines.json pattern):
+      #   - Real baseline with non-empty metrics → has_baseline=true (full comparison).
+      #   - Baseline exists but metrics empty    → has_baseline=false; compare_performance
+      #     falls back to ci/performance-seed.json approximate values automatically.
+      #   - No baseline file on main             → has_baseline=false; first-time setup.
+      - name: Baseline from main
+        id: baseline
+        run: |
+          mkdir -p "${{ github.workspace }}/build"
+          git fetch origin main 2>/dev/null || git fetch origin master 2>/dev/null || true
+          BASE_REF=""
+          if git cat-file -e origin/main:ci/performance-baseline.json 2>/dev/null; then
+            BASE_REF=origin/main
+          elif git cat-file -e origin/master:ci/performance-baseline.json 2>/dev/null; then
+            BASE_REF=origin/master
+          fi
+          if [ -n "${BASE_REF}" ]; then
+            git show "${BASE_REF}:ci/performance-baseline.json" > "${{ github.workspace }}/build/baseline.json"
+            # Treat baseline as real only when it has non-empty metrics.
+            # When empty, compare_performance uses the seed file as a fallback.
+            METRIC_COUNT=$(python3 -c "
+          import json, sys
+          try:
+            d = json.load(open('${{ github.workspace }}/build/baseline.json'))
+            print(len(d.get('metrics') or {}))
+          except Exception:
+            print(0)
+          " 2>/dev/null || echo "0")
+            if [ "${METRIC_COUNT}" -gt 0 ]; then
+              echo "has_baseline=true" >> "$GITHUB_OUTPUT"
+              echo "Baseline loaded from ${BASE_REF} (${METRIC_COUNT} metrics)."
+            else
+              echo "has_baseline=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::Baseline on main has empty metrics — seed values (ci/performance-seed.json) will be used for PR comparison until 'Performance baseline (main)' records live data."
+            fi
+          else
+            echo '{"schemaVersion":1,"metrics":{}}' > "${{ github.workspace }}/build/baseline.json"
+            echo "has_baseline=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No ci/performance-baseline.json on main yet — first-time setup. Merge to main or run Actions → Performance baseline (main) to record a baseline."
+          fi
+
+      - name: Run UI performance tests
+        id: perf_tests
+        continue-on-error: true
+        timeout-minutes: 40
+        run: |
+          chmod +x .github/scripts/ci_run_ios_ui_performance_tests.sh
+          .github/scripts/ci_run_ios_ui_performance_tests.sh
+
+      - name: Extract metrics JSON
+        if: steps.perf_tests.outcome != 'cancelled'
+        continue-on-error: true
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          if [[ ! -d build/TestResults.xcresult ]]; then
+            echo "::warning::No TestResults.xcresult — writing empty metrics (xcodebuild likely failed)."
+            echo '{"schemaVersion":1,"metrics":{}}' > build/current-metrics.json
+            exit 0
+          fi
+          python3 .github/scripts/extract_performance_metrics.py \
+            --xcresult build/TestResults.xcresult \
+            --xcodebuild-log build/xcodebuild-test.log \
+            --out build/current-metrics.json
+          python3 -c "import json; d=json.load(open('build/current-metrics.json')); print('PR metrics:', len(d.get('metrics') or {}), 'blobs:', d.get('rawPerformanceObjects'), 'logKeys:', d.get('logMetricKeys'))"
+
+      - name: Compare to baseline
+        id: compare
+        if: steps.perf_tests.outcome != 'cancelled'
+        working-directory: ${{ github.workspace }}
+        run: |
+          python3 .github/scripts/compare_performance.py \
+            --current build/current-metrics.json \
+            --baseline build/baseline.json \
+            --seed ci/performance-seed.json \
+            --summary-out build/perf-comment.md
+
+      - name: PR comment
+        if: always() && inputs.pr_number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! command -v gh &>/dev/null; then
+            echo "::warning::gh CLI not found on runner — skipping PR comment. Install with: brew install gh"
+            exit 0
+          fi
+          if [[ -f build/perf-comment.md ]]; then
+            gh pr comment "${PR_NUMBER}" --body-file build/perf-comment.md
+          else
+            gh pr comment "${PR_NUMBER}" --body "Performance workflow did not produce a comparison report (tests or extraction failed). Check the workflow logs and uploaded xcresult artifact."
+          fi
+
+      - name: Upload xcresult
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-xcresult-${{ github.run_id }}
+          path: build/TestResults.xcresult
+          if-no-files-found: ignore
+
+      - name: Upload xcodebuild log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-xcodebuild-log-${{ github.run_id }}
+          path: build/xcodebuild-test.log
+          if-no-files-found: ignore
+
+      - name: Capture simulator diagnostics on failure
+        if: failure() && steps.perf_tests.outcome == 'failure'
+        continue-on-error: true
+        run: |
+          echo "Simulator diagnostics:"
+          xcrun simctl list devices
+          echo ""
+          echo "Checking for crash logs:"
+          ls -la ~/Library/Logs/DiagnosticReports/ | tail -20 || true
+
+      - name: Fail on regression (opt-in)
+        if: steps.compare.outcome == 'failure'
+        run: |
+          echo "::error::Compare step requested failure (PERF_FAIL_ON_REGRESSION=true and a gated metric regressed)."
+          exit 1
+
+      # When ci/performance-baseline.json does not exist on main yet (first-time setup),
+      # xcodebuild performance tests may fail without a meaningful regression signal.
+      # Warn instead of failing so the first merge to main can establish the baseline.
+      - name: Fail if performance tests failed
+        if: steps.perf_tests.outcome == 'failure'
+        run: |
+          if [ "${{ steps.baseline.outputs.has_baseline }}" != "true" ]; then
+            echo "::warning::iOS performance tests failed but no baseline exists on main yet (first-time setup). Merge to main to record a baseline via the 'Performance baseline (main)' workflow, then failures will be enforced."
+          else
+            echo "::error::UI performance xcodebuild test failed — see xcodebuild log artifact. PR comment may still list extracted metrics."
+            exit 1
+          fi

@@ -1,0 +1,211 @@
+# React Native CI/CD — Expo (committed native) orchestrator (installed by prune_workflows_for_flavor.py).
+
+name: React Native CI/CD
+
+on:
+  push:
+    branches: [main, master, development]
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    branches: [main, master, development]
+  workflow_dispatch:
+    inputs:
+      package_manager:
+        description: "auto | npm | yarn (passed to install_js_deps in reusable jobs that support it)"
+        type: string
+        default: auto
+      run_internal_release_only:
+        description: Reserved for internal-only mode
+        type: boolean
+        default: false
+
+concurrency:
+  group: rn-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  determine-perf-runners:
+    runs-on: ubuntu-latest
+    outputs:
+      android_runner:       ${{ steps.pick.outputs.android_runner }}
+      android_arch:         ${{ steps.pick.outputs.android_arch }}
+      android_gpu:          ${{ steps.pick.outputs.android_gpu }}
+      android_setup_java:   ${{ steps.pick.outputs.android_setup_java }}
+      android_setup_python: ${{ steps.pick.outputs.android_setup_python }}
+      android_setup_node:   ${{ steps.pick.outputs.android_setup_node }}
+      android_setup_sdk:    ${{ steps.pick.outputs.android_setup_sdk }}
+      ios_runner:           ${{ steps.pick.outputs.ios_runner }}
+      ios_setup_xcode:      ${{ steps.pick.outputs.ios_setup_xcode }}
+      ios_setup_node:       ${{ steps.pick.outputs.ios_setup_node }}
+      ios_setup_ruby:       ${{ steps.pick.outputs.ios_setup_ruby }}
+    steps:
+      - id: pick
+        env:
+          PERF_ANDROID_RUNNER: ${{ vars.PERF_ANDROID_RUNNER }}
+          PERF_IOS_RUNNER: ${{ vars.PERF_IOS_RUNNER }}
+        run: |
+          ANDROID="${PERF_ANDROID_RUNNER:-}"
+          if [ "${ANDROID}" = "cloud" ] || [[ "${ANDROID}" == ubuntu* ]]; then
+            echo "android_runner=ubuntu-latest"          >> "$GITHUB_OUTPUT"
+            echo "android_arch=x86_64"                   >> "$GITHUB_OUTPUT"
+            echo "android_gpu=swiftshader_indirect"       >> "$GITHUB_OUTPUT"
+            echo "android_setup_java=true"               >> "$GITHUB_OUTPUT"
+            echo "android_setup_python=true"             >> "$GITHUB_OUTPUT"
+            echo "android_setup_node=true"               >> "$GITHUB_OUTPUT"
+            echo "android_setup_sdk=true"                >> "$GITHUB_OUTPUT"
+          else
+            echo "android_runner=self-hosted"            >> "$GITHUB_OUTPUT"
+            echo "android_arch=arm64-v8a"                >> "$GITHUB_OUTPUT"
+            echo "android_gpu=auto"                      >> "$GITHUB_OUTPUT"
+            echo "android_setup_java=false"              >> "$GITHUB_OUTPUT"
+            echo "android_setup_python=false"            >> "$GITHUB_OUTPUT"
+            echo "android_setup_node=false"              >> "$GITHUB_OUTPUT"
+            echo "android_setup_sdk=false"               >> "$GITHUB_OUTPUT"
+          fi
+
+          IOS="${PERF_IOS_RUNNER:-}"
+          if [ -z "$IOS" ] || [[ "$IOS" == macos* ]]; then
+            echo "ios_runner=${IOS:-macos-15}"           >> "$GITHUB_OUTPUT"
+            echo "ios_setup_xcode=true"                  >> "$GITHUB_OUTPUT"
+            echo "ios_setup_node=true"                   >> "$GITHUB_OUTPUT"
+            echo "ios_setup_ruby=true"                   >> "$GITHUB_OUTPUT"
+          else
+            echo "ios_runner=${IOS}"                     >> "$GITHUB_OUTPUT"
+            echo "ios_setup_xcode=false"                 >> "$GITHUB_OUTPUT"
+            echo "ios_setup_node=false"                  >> "$GITHUB_OUTPUT"
+            echo "ios_setup_ruby=false"                  >> "$GITHUB_OUTPUT"
+          fi
+
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      build_system: ${{ steps.pick.outputs.build_system }}
+    steps:
+      - id: pick
+        run: echo "build_system=expo" >> "$GITHUB_OUTPUT"
+
+  js-lint:
+    needs: [detect]
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_internal_release_only == false }}
+    uses: ./.github/workflows/rn-job-js-lint.yml
+
+  security:
+    needs: [detect]
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_internal_release_only == false }}
+    uses: ./.github/workflows/rn-job-security.yml
+    secrets: inherit
+
+  js-test:
+    needs: [js-lint, security]
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_internal_release_only == false }}
+    uses: ./.github/workflows/rn-job-js-test.yml
+    with:
+      coverage_threshold_percent: "80"
+
+  expo-native-dirs:
+    if: |
+      (github.event_name != 'workflow_dispatch' || inputs.run_internal_release_only == false) &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/development')) ||
+       (github.event_name == 'pull_request' && (github.base_ref == 'main' || github.base_ref == 'master' || github.base_ref == 'development')))
+    needs: [detect, js-lint, security, js-test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - name: Assert committed native dirs for Expo
+        env:
+          BUILD_SYSTEM: ${{ needs.detect.outputs.build_system }}
+        run: bash .github/scripts/assert_expo_native_dirs.sh "$BUILD_SYSTEM"
+
+  android-dev:
+    if: |
+      (github.event_name != 'workflow_dispatch' || inputs.run_internal_release_only == false) &&
+      needs.detect.outputs.build_system == 'expo' &&
+      needs.expo-native-dirs.result == 'success' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/development')) ||
+       (github.event_name == 'pull_request' && (github.base_ref == 'main' || github.base_ref == 'master' || github.base_ref == 'development')))
+    needs: [detect, js-lint, security, js-test, expo-native-dirs]
+    uses: ./.github/workflows/rn-job-android-firebase-release.yml
+    with:
+      branch: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      firebase_android_app: dev
+      gradle_task: assembleRelease
+      artifact_glob: app/build/outputs/apk/release/*.apk
+      release_notes: ""
+      dry_run: false
+      upload_to_firebase: ${{ github.event_name == 'push' }}
+      firebase_groups: internal-qa
+    secrets: inherit
+
+  android-perf:
+    needs: [android-dev, determine-perf-runners]
+    if: needs.android-dev.result == 'success' && needs.determine-perf-runners.result == 'success'
+    uses: ./.github/workflows/rn-job-android-perf.yml
+    permissions:
+      contents: write
+      pull-requests: write
+    with:
+      package: "com.codeandtheory.templatepipelinetest.dev"
+      activity: "com.codeandtheory.templatepipelinetest.dev/com.codeandtheory.templatepipelinetest.dev.MainActivity"
+      apk_artifact_name: "signed-apk-firebase-dev-${{ github.run_number }}"
+      runner:           ${{ needs.determine-perf-runners.outputs.android_runner }}
+      emulator_arch:    ${{ needs.determine-perf-runners.outputs.android_arch }}
+      emulator_gpu:     ${{ needs.determine-perf-runners.outputs.android_gpu }}
+      setup_java:       ${{ needs.determine-perf-runners.outputs.android_setup_java == 'true' }}
+      setup_python:     ${{ needs.determine-perf-runners.outputs.android_setup_python == 'true' }}
+      setup_node:       ${{ needs.determine-perf-runners.outputs.android_setup_node == 'true' }}
+      setup_android_sdk: ${{ needs.determine-perf-runners.outputs.android_setup_sdk == 'true' }}
+      job_timeout_minutes: 30
+      baselines_path: "scripts/perf/perf_baselines.json"
+      baseline_tolerance_pct: 25
+      soft: true
+      fail_on_regression: false
+      out_dir: "build/reports/perf"
+      artifact_retention_days: 14
+    secrets: inherit
+
+  ios-dev:
+    if: |
+      (github.event_name != 'workflow_dispatch' || inputs.run_internal_release_only == false) &&
+      needs.detect.outputs.build_system == 'expo' &&
+      needs.expo-native-dirs.result == 'success' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/development')) ||
+       (github.event_name == 'pull_request' && (github.base_ref == 'main' || github.base_ref == 'master' || github.base_ref == 'development')))
+    needs: [detect, js-lint, security, js-test, expo-native-dirs, determine-perf-runners]
+    uses: ./.github/workflows/rn-job-ios-firebase-release.yml
+    with:
+      branch: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      firebase_ios_app: dev
+      app_identifier: com.codeandtheory.templatepipelinetest.dev
+      ios_scheme: TestExpoBootstrapDev
+      ios_workspace: ios/TestExpoBootstrapDev.xcworkspace
+      dry_run: false
+      upload_to_firebase: ${{ github.event_name == 'push' }}
+      firebase_groups: internal-qa
+      release_notes: ""
+      produce_test_products: false
+    secrets: inherit
+
+  ios-performance:
+    if: |
+      needs.ios-dev.result == 'success' &&
+      needs.determine-perf-runners.result == 'success'
+    needs: [ios-dev, determine-perf-runners]
+    uses: ./.github/workflows/rn-job-ios-performance.yml
+    with:
+      perf_metrics_mode: full
+      pr_number: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
+      runner:       ${{ needs.determine-perf-runners.outputs.ios_runner }}
+      setup_xcode:  ${{ needs.determine-perf-runners.outputs.ios_setup_xcode == 'true' }}
+      setup_node:   ${{ needs.determine-perf-runners.outputs.ios_setup_node == 'true' }}
+      setup_ruby:   ${{ needs.determine-perf-runners.outputs.ios_setup_ruby == 'true' }}
+      job_timeout_minutes: 60
+    permissions:
+      contents: read
+      pull-requests: write
+    secrets: inherit

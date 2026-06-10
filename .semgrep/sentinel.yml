@@ -1,0 +1,6 @@
+rules:
+  - id: pipeline-semgrep-test-sentinel
+    pattern: PIPELINE_SEMGREP_TEST_SENTINEL
+    message: Pipeline working
+    severity: ERROR
+    languages: [java, kotlin, swift]

@@ -1,0 +1,225 @@
+# frozen_string_literal: true
+
+require "fileutils"
+require "shellwords"
+require "spaceship"
+
+GOOGLE_APP_ID_PLACEHOLDER = "1:000000000000:ios:0000000000000000000000"
+
+def google_app_id_for_build
+  from_env = ENV["GOOGLE_APP_ID"].to_s.strip
+  return from_env unless from_env.empty?
+
+  %w[
+    ../ios/TestExpoBootstrapDev/GoogleService-Info.plist
+    ../GoogleService-Info.plist.example
+  ].each do |relative_path|
+    path = File.expand_path(relative_path)
+    next unless File.exist?(path)
+
+    value = `/usr/libexec/PlistBuddy -c 'Print :GOOGLE_APP_ID' #{Shellwords.escape(path)} 2>/dev/null`.strip
+    return value unless value.empty?
+  end
+
+  UI.important(
+    "GOOGLE_APP_ID not found in plist — using placeholder so Firebase Crashlytics build phase does not fail."
+  )
+  GOOGLE_APP_ID_PLACEHOLDER
+end
+
+def ensure_google_service_plist!
+  dest = File.expand_path("../ios/TestExpoBootstrapDev/GoogleService-Info.plist")
+  return if File.exist?(dest)
+
+  example = File.expand_path("../GoogleService-Info.plist.example")
+  return unless File.exist?(example)
+
+  FileUtils.mkdir_p(File.dirname(dest))
+  FileUtils.cp(example, dest)
+  UI.important("Copied GoogleService-Info.plist.example → #{dest}")
+end
+
+def resolve_latest_testflight_build_number(api_key:, app_identifier:)
+  latest_testflight_build_number(
+    api_key: api_key,
+    app_identifier: app_identifier,
+    initial_build_number: 0
+  )
+rescue StandardError => e
+  unless e.message.include?("Could not find an app on App Store Connect")
+    raise
+  end
+  UI.important(
+    "No App Store Connect app for #{app_identifier} — starting CFBundleVersion at 1."
+  )
+  0
+end
+
+default_platform(:ios)
+
+platform :ios do
+  desc "CI: keychain signing (secrets) + gym IPA for App Store / TestFlight"
+  lane :staging_build do
+    team_id = ENV.fetch("APPLE_TEAM_ID")
+    profile_name = ENV.fetch("IOS_PROVISIONING_PROFILE_NAME")
+    bundle_id = ENV.fetch("APP_IDENTIFIER")
+
+    if ENV["GITHUB_ACTIONS"] == "true" && ENV["APP_STORE_CONNECT_KEY_ID"]
+      api_key = app_store_connect_api_key(
+        key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+        issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+        key_content: ENV.fetch("APP_STORE_CONNECT_API_KEY"),
+        is_key_content_base64: false,
+        duration: 1200,
+        in_house: false
+      )
+      latest = resolve_latest_testflight_build_number(
+        api_key: api_key,
+        app_identifier: bundle_id
+      )
+      next_build = latest.to_i + 1
+      increment_build_number(
+        build_number: next_build.to_s,
+        xcodeproj: "ios/TestExpoBootstrapDev.xcodeproj"
+      )
+      UI.success("Set CFBundleVersion to #{next_build} (latest TestFlight was #{latest.to_i})")
+    end
+
+    export_method = ENV["IOS_EXPORT_METHOD"].to_s.strip
+    export_method = "app-store" if export_method.empty?
+
+    ensure_google_service_plist!
+
+    identity = ENV["IOS_CODESIGN_IDENTITY"].to_s.strip
+    if identity.empty? && %w[app-store ad-hoc].include?(export_method)
+      identity = "Apple Distribution"
+    end
+
+    # Write PROVISIONING_PROFILE_SPECIFIER and CODE_SIGN_IDENTITY directly into the
+    # app target xcconfig (ios/xcconfig/Prod.Release.xcconfig).  This file is only
+    # referenced by the TemplatePipelineReactNative target — Pod targets have their
+    # own CocoaPods-generated xcconfigs and never see this file.
+    #
+    # xcodebuild does NOT support [target=NAME] bracket notation on the command line
+    # (it parses the key at the first '=' and produces garbled values like
+    # "TemplatePipelineReactNative]=ProfileName" that are then applied globally).
+    # Writing to the xcconfig is the only reliable way to scope signing settings to
+    # the app target without touching every Pod target.
+    signing_xcconfig_path = File.expand_path("../ios/xcconfig/Prod.Release.xcconfig")
+    xcconfig_lines = File.exist?(signing_xcconfig_path) ? File.readlines(signing_xcconfig_path) : []
+    {
+      "PROVISIONING_PROFILE_SPECIFIER" => profile_name,
+      "CODE_SIGN_IDENTITY" => identity
+    }.each do |key, value|
+      next if value.nil? || value.strip.empty?
+
+      idx = xcconfig_lines.find_index { |l| l.strip.start_with?("#{key} =", "#{key}=") }
+      line = "#{key} = #{value}\n"
+      if idx
+        xcconfig_lines[idx] = line
+      else
+        xcconfig_lines << line
+      end
+    end
+    File.write(signing_xcconfig_path, xcconfig_lines.join)
+    UI.message("Wrote signing settings to #{signing_xcconfig_path}")
+    UI.message("=== #{signing_xcconfig_path} ===\n#{File.read(signing_xcconfig_path)}\n===")
+
+    # Global xcargs — applied to every target in the workspace, including Pod static
+    # libraries.  Only values that are safe for Pod targets are listed here:
+    #   CODE_SIGN_STYLE=Manual  — overrides the project-level Automatic flag; Pod
+    #     static libraries are fine with Manual + no profile specifier.
+    #   CODE_SIGN_IDENTITY      — overrides the pbxproj project-level conditional
+    #     "CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "iPhone Developer" which has higher
+    #     precedence than xcconfig and would otherwise shadow our xcconfig value.
+    #     Static library Pod targets are not code-signed so this is harmless for them.
+    #   DEVELOPMENT_TEAM        — harmless for Pods.
+    #   GOOGLE_APP_ID           — harmless for Pods; required by Crashlytics run-script.
+    #   PRODUCT_BUNDLE_IDENTIFIER — harmless for Pods.
+    # PROVISIONING_PROFILE_SPECIFIER is intentionally omitted here; it lives in the
+    # xcconfig above so it only applies to the app target (not Pod targets).
+    xcargs = {
+      "CODE_SIGN_STYLE" => "Manual",
+      "CODE_SIGN_IDENTITY" => identity,
+      "DEVELOPMENT_TEAM" => team_id,
+      "GOOGLE_APP_ID" => google_app_id_for_build,
+      "PRODUCT_BUNDLE_IDENTIFIER" => bundle_id
+    }
+
+    bc = ENV["IOS_BUILD_CONFIGURATION"]
+
+    gym_args = {
+      workspace: "ios/TestExpoBootstrapDev.xcworkspace",
+      scheme: ENV.fetch("IOS_SCHEME", "TestExpoBootstrapDev"),
+      export_method: export_method,
+      output_directory: "build",
+      output_name: "TestExpoBootstrapDev.ipa",
+      clean: true,
+      buildlog_path: "build/gym-logs",
+      disable_xcpretty: true,
+      xcargs: xcargs,
+      export_options: {
+        method: export_method,
+        signingStyle: "manual",
+        teamID: team_id,
+        provisioningProfiles: {
+          bundle_id => profile_name
+        }
+      }
+    }
+    gym_args[:configuration] = bc.strip if bc && !bc.strip.empty?
+    gym(**gym_args)
+  end
+
+  desc "Upload an existing IPA to TestFlight (App Store Connect API key via env)"
+  lane :upload_testflight_ipa do |options|
+    ipa_path = options[:ipa] || ENV["IPA_PATH"]
+    UI.user_error!("Missing ipa path (pass ipa: or IPA_PATH)") if ipa_path.nil? || ipa_path.to_s.empty? || !File.exist?(ipa_path)
+
+    api_key = app_store_connect_api_key(
+      key_id: ENV.fetch("APP_STORE_CONNECT_KEY_ID"),
+      issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
+      key_content: ENV.fetch("APP_STORE_CONNECT_API_KEY"),
+      is_key_content_base64: false,
+      duration: 1200,
+      in_house: false
+    )
+
+    # upload_to_testflight cannot create an app, and `produce` can't either with
+    # API-key-only auth: produce's App Store Connect path calls
+    # Spaceship::ConnectAPI.login → Spaceship::Tunes.login, which forces an Apple
+    # ID web session and ignores the API token (hence "No value found for
+    # 'username'"). The App Store Connect API *can* create apps with the token,
+    # so we call it directly. The token was set above by app_store_connect_api_key
+    # (set_spaceship_token: true). Idempotent: no-op when the app already exists.
+    # The API key must have Admin or App Manager access — a Developer-role key
+    # cannot create apps. company_name is only needed for the FIRST app on the
+    # account.
+    bundle_id = ENV.fetch("APP_IDENTIFIER")
+    if Spaceship::ConnectAPI::App.find(bundle_id)
+      UI.success("App '#{bundle_id}' already exists on App Store Connect — skipping creation.")
+    else
+      sku = ENV["APP_SKU"].to_s.strip
+      sku = bundle_id if sku.empty?
+      company_name = ENV["APP_COMPANY_NAME"].to_s.strip
+      create_args = {
+        name: ENV.fetch("APP_NAME"),
+        version_string: "1.0",
+        sku: sku,
+        primary_locale: ENV.fetch("APP_PRIMARY_LANGUAGE", "en-US"),
+        bundle_id: bundle_id,
+        platforms: [Spaceship::ConnectAPI::Platform::IOS]
+      }
+      create_args[:company_name] = company_name unless company_name.empty?
+      UI.message("Creating App Store Connect record for '#{bundle_id}'...")
+      Spaceship::ConnectAPI::App.create(**create_args)
+      UI.success("Created App Store Connect record for '#{bundle_id}'.")
+    end
+
+    upload_to_testflight(
+      api_key: api_key,
+      ipa: ipa_path,
+      skip_waiting_for_build_processing: true
+    )
+  end
+end

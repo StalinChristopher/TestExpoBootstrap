@@ -1,0 +1,47 @@
+name: RN — security (Semgrep, TruffleHog, Snyk)
+
+on:
+  workflow_call:
+    secrets:
+      SNYK_TOKEN:
+        required: false
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    env:
+      # Pin release: upstream tags "latest" before linux/amd64 assets exist → install 404.
+      # Bump when v3.95.4+ has full assets on https://github.com/trufflesecurity/trufflehog/releases
+      TRUFFLEHOG_VERSION: v3.95.3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Semgrep
+        run: |
+          python3 -m pip install --user semgrep
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          semgrep scan --config .semgrep/ \
+            --exclude '**/node_modules/**' --exclude '**/Pods/**' \
+            --error
+      - name: TruffleHog
+        run: |
+          TH_DIR="${RUNNER_TEMP}/trufflehog-bin"
+          mkdir -p "$TH_DIR"
+          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b "$TH_DIR" "${TRUFFLEHOG_VERSION}"
+          export PATH="$TH_DIR:$PATH"
+          trufflehog filesystem . --fail \
+            --exclude-paths .github/trufflehog-exclude-paths.txt
+      - name: Snyk
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          if [ -z "${SNYK_TOKEN:-}" ]; then
+            echo "::notice::SNYK_TOKEN not set — skipping Snyk"
+            exit 0
+          fi
+          SNYK_BIN="${RUNNER_TEMP}/snyk"
+          curl -sSfL https://static.snyk.io/cli/latest/snyk-linux -o "$SNYK_BIN"
+          chmod +x "$SNYK_BIN"
+          "$SNYK_BIN" auth "$SNYK_TOKEN"
+          "$SNYK_BIN" test --all-projects --fail-on=all

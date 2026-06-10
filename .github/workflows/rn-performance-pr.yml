@@ -1,0 +1,28 @@
+# iOS UI performance on PRs is run from the main orchestrator (rn.yml → ios-performance after ios-dev).
+# This file is kept for manual re-runs only.
+
+name: RN Performance (PR) — manual
+
+on:
+  workflow_dispatch:
+    inputs:
+      perf_metrics_mode:
+        description: full (launch + CPU/memory) or launch (smoke)
+        type: choice
+        options: [full, launch]
+        default: full
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  ui-performance:
+    uses: ./.github/workflows/rn-job-ios-performance.yml
+    with:
+      perf_metrics_mode: ${{ inputs.perf_metrics_mode }}
+      pr_number: ''
+    permissions:
+      contents: read
+      pull-requests: write
+    secrets: inherit

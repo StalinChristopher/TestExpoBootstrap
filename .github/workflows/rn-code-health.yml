@@ -1,0 +1,47 @@
+name: RN code health
+
+on:
+  push:
+    branches: [main, master, development]
+  pull_request:
+    branches: [main, master, development]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reports:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - run: bash .github/scripts/install_js_deps.sh auto
+      - name: ESLint JSON
+        run: |
+          mkdir -p Reports
+          npx eslint . -f json -o Reports/eslint.json || true
+      - name: Tech debt
+        if: always()
+        run: python3 .github/scripts/tech_debt_scan.py
+      - name: Security patterns
+        if: always()
+        run: python3 .github/scripts/security_patterns_scan.py
+      - name: Health summary
+        if: always()
+        run: python3 .github/scripts/codebase_health_report.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rn-code-health-reports
+          path: |
+            Reports/*.md
+            Reports/eslint.json
+          if-no-files-found: warn

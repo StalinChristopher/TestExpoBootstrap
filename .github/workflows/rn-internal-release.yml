@@ -1,0 +1,64 @@
+# Manual internal release — Expo committed native (installed by prune_workflows_for_flavor.py).
+name: RN — internal release
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: android | ios | both
+        type: choice
+        options: [android, ios, both]
+        default: both
+      branch:
+        description: "Git branch or ref to build (e.g. main)"
+        required: true
+        type: string
+      release_notes:
+        description: Short notes for stakeholders (optional, Android)
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        description: Skips store upload / TestFlight
+        required: false
+        type: boolean
+        default: false
+      upload_to_testflight:
+        description: After gym, upload IPA to TestFlight (iOS)
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: rn-internal-release-${{ github.repository }}-${{ inputs.branch }}
+  cancel-in-progress: false
+
+jobs:
+  expo-native-dirs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+      - name: Assert committed native dirs for Expo
+        run: bash .github/scripts/assert_expo_native_dirs.sh expo
+
+  android-internal:
+    needs: [expo-native-dirs]
+    if: inputs.platform == 'android' || inputs.platform == 'both'
+    uses: ./.github/workflows/rn-job-android-internal-release.yml
+    with:
+      branch: ${{ inputs.branch }}
+      release_notes: ${{ inputs.release_notes }}
+      dry_run: ${{ inputs.dry_run }}
+    secrets: inherit
+
+  ios-internal:
+    needs: [expo-native-dirs]
+    if: inputs.platform == 'ios' || inputs.platform == 'both'
+    uses: ./.github/workflows/rn-job-ios-internal-release.yml
+    with:
+      branch: ${{ inputs.branch }}
+      dry_run: ${{ inputs.dry_run }}
+      upload_to_testflight: ${{ inputs.upload_to_testflight }}
+    secrets: inherit
