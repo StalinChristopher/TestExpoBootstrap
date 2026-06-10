@@ -387,6 +387,8 @@ def fastfile_targeted_replacements(
         (f'../{OLD_APP_FOLDER}/', f"../{new_app_folder}/"),
         ('ENV.fetch("IOS_SCHEME", "Prod")', f'ENV.fetch("IOS_SCHEME", "{scheme_prod}")'),
         ('ENV.fetch("IOS_SCHEME", "Dev")', f'ENV.fetch("IOS_SCHEME", "{scheme_dev}")'),
+        (OLD_IPA_XCODE_STEM, ipa_filename),
+        (f'output_name: "{OLD_IPA_XCODE_STEM}"', f'output_name: "{ipa_filename}"'),
     ]
 
 

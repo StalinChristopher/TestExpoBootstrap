@@ -39,6 +39,43 @@ def ensure_google_service_plist!
   UI.important("Copied GoogleService-Info.plist.example → #{dest}")
 end
 
+def resolve_signing_xcconfig_path(build_configuration)
+  xcconfig_dir = File.expand_path("../ios/xcconfig")
+  return nil unless File.directory?(xcconfig_dir)
+
+  mapping = {
+    "Release-Prod" => "Prod.Release.xcconfig",
+    "Release-Dev" => "Dev.Release.xcconfig",
+    "Debug-Dev" => "Dev.Debug.xcconfig",
+    "Debug-Prod" => "Prod.Debug.xcconfig",
+    "Release-QA" => "QA.Release.xcconfig",
+    "Debug-QA" => "QA.Debug.xcconfig"
+  }
+  filename = mapping[build_configuration.to_s.strip]
+  filename ? File.join(xcconfig_dir, filename) : nil
+end
+
+def write_signing_settings_to_xcconfig(path, profile_name:, identity:)
+  xcconfig_lines = File.readlines(path)
+  {
+    "PROVISIONING_PROFILE_SPECIFIER" => profile_name,
+    "CODE_SIGN_IDENTITY" => identity
+  }.each do |key, value|
+    next if value.nil? || value.strip.empty?
+
+    idx = xcconfig_lines.find_index { |l| l.strip.start_with?("#{key} =", "#{key}=") }
+    line = "#{key} = #{value}\n"
+    if idx
+      xcconfig_lines[idx] = line
+    else
+      xcconfig_lines << line
+    end
+  end
+  File.write(path, xcconfig_lines.join)
+  UI.message("Wrote signing settings to #{path}")
+  UI.message("=== #{path} ===\n#{File.read(path)}\n===")
+end
+
 def resolve_latest_testflight_build_number(api_key:, app_identifier:)
   latest_testflight_build_number(
     api_key: api_key,
@@ -95,35 +132,29 @@ platform :ios do
       identity = "Apple Distribution"
     end
 
-    # Write PROVISIONING_PROFILE_SPECIFIER and CODE_SIGN_IDENTITY directly into the
-    # app target xcconfig (ios/xcconfig/Prod.Release.xcconfig).  This file is only
-    # referenced by the TemplatePipelineReactNative target — Pod targets have their
-    # own CocoaPods-generated xcconfigs and never see this file.
-    #
-    # xcodebuild does NOT support [target=NAME] bracket notation on the command line
-    # (it parses the key at the first '=' and produces garbled values like
-    # "TemplatePipelineReactNative]=ProfileName" that are then applied globally).
-    # Writing to the xcconfig is the only reliable way to scope signing settings to
-    # the app target without touching every Pod target.
-    signing_xcconfig_path = File.expand_path("../ios/xcconfig/Prod.Release.xcconfig")
-    xcconfig_lines = File.exist?(signing_xcconfig_path) ? File.readlines(signing_xcconfig_path) : []
-    {
-      "PROVISIONING_PROFILE_SPECIFIER" => profile_name,
-      "CODE_SIGN_IDENTITY" => identity
-    }.each do |key, value|
-      next if value.nil? || value.strip.empty?
+    bc = ENV["IOS_BUILD_CONFIGURATION"].to_s.strip
+    signing_xcconfig_path = resolve_signing_xcconfig_path(bc)
+    use_xcconfig_signing = false
 
-      idx = xcconfig_lines.find_index { |l| l.strip.start_with?("#{key} =", "#{key}=") }
-      line = "#{key} = #{value}\n"
-      if idx
-        xcconfig_lines[idx] = line
-      else
-        xcconfig_lines << line
+    if signing_xcconfig_path
+      unless File.exist?(signing_xcconfig_path)
+        UI.user_error!(
+          "Expected signing xcconfig at #{signing_xcconfig_path} for IOS_BUILD_CONFIGURATION=#{bc.inspect} " \
+          "but file is missing — regenerate ios/xcconfig for CT flavor layout"
+        )
       end
+      write_signing_settings_to_xcconfig(
+        signing_xcconfig_path,
+        profile_name: profile_name,
+        identity: identity
+      )
+      use_xcconfig_signing = true
+    else
+      UI.important(
+        "No ios/xcconfig signing file for IOS_BUILD_CONFIGURATION=#{bc.empty? ? '(unset)' : bc} " \
+        "— using xcargs/export_options (Expo or plain Debug/Release layout)"
+      )
     end
-    File.write(signing_xcconfig_path, xcconfig_lines.join)
-    UI.message("Wrote signing settings to #{signing_xcconfig_path}")
-    UI.message("=== #{signing_xcconfig_path} ===\n#{File.read(signing_xcconfig_path)}\n===")
 
     # Global xcargs — applied to every target in the workspace, including Pod static
     # libraries.  Only values that are safe for Pod targets are listed here:
@@ -136,8 +167,8 @@ platform :ios do
     #   DEVELOPMENT_TEAM        — harmless for Pods.
     #   GOOGLE_APP_ID           — harmless for Pods; required by Crashlytics run-script.
     #   PRODUCT_BUNDLE_IDENTIFIER — harmless for Pods.
-    # PROVISIONING_PROFILE_SPECIFIER is intentionally omitted here; it lives in the
-    # xcconfig above so it only applies to the app target (not Pod targets).
+    # PROVISIONING_PROFILE_SPECIFIER is omitted for CT xcconfig signing; for Expo it is
+    # added below so manual signing works without ios/xcconfig/.
     xcargs = {
       "CODE_SIGN_STYLE" => "Manual",
       "CODE_SIGN_IDENTITY" => identity,
@@ -145,8 +176,9 @@ platform :ios do
       "GOOGLE_APP_ID" => google_app_id_for_build,
       "PRODUCT_BUNDLE_IDENTIFIER" => bundle_id
     }
-
-    bc = ENV["IOS_BUILD_CONFIGURATION"]
+    unless use_xcconfig_signing
+      xcargs["PROVISIONING_PROFILE_SPECIFIER"] = profile_name if profile_name && !profile_name.strip.empty?
+    end
 
     gym_args = {
       workspace: "ios/TestExpoBootstrapDev.xcworkspace",
@@ -167,7 +199,7 @@ platform :ios do
         }
       }
     }
-    gym_args[:configuration] = bc.strip if bc && !bc.strip.empty?
+    gym_args[:configuration] = bc unless bc.empty?
     gym(**gym_args)
   end
 

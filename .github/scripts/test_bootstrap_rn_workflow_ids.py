@@ -132,13 +132,16 @@ class TestFastfileTargetedReplacements(unittest.TestCase):
         text = bootstrap.apply_replacements(
             'workspace: "ios/TemplatePipelineReactNative.xcworkspace"\n'
             'scheme: ENV.fetch("IOS_SCHEME", "Prod")\n'
+            'output_name: "TemplatePipelineReactNative.ipa"\n'
             'path: "../ios/TemplatePipelineReactNative/GoogleService-Info.plist"\n',
             mapping,
         )
         self.assertIn("ios/ExpoWorkflowTestDev.xcworkspace", text)
         self.assertIn('ENV.fetch("IOS_SCHEME", "ExpoWorkflowTestDev")', text)
+        self.assertIn('output_name: "ExpoWorkflowTestDev.ipa"', text)
         self.assertIn("../ios/ExpoWorkflowTestDev/GoogleService-Info.plist", text)
         self.assertNotIn("ExpoWorkflowTestExpoWorkflowTestDev", text)
+        self.assertNotIn("TemplatePipelineReactNative.ipa", text)
 
 
 if __name__ == "__main__":
