@@ -11,7 +11,7 @@ import { AboutDrawerScreen } from "../screens/drawer/AboutDrawerScreen";
 import type { DrawerParamList } from "./types";
 import { MainTabs } from "./MainTabs";
 import { SettingsScreen } from "../screens/profile/SettingsScreen";
-import { CarouselCatalogScreen } from '../screens/CarouselCatalogScreen';
+import { CarouselCatalogScreen } from "../screens/CarouselCatalogScreen";
 
 const Drawer = createDrawerNavigator<DrawerParamList>();
 
@@ -67,10 +67,10 @@ export function MainDrawer() {
         options={{ title: t("drawer.aboutTitle") }}
       />
       <Drawer.Screen
-              name="CarouselCatalog"
-              component={CarouselCatalogScreen}
-              options={{ title: 'Carousel', drawerLabel: 'Carousel Catalog' }}
-            />
+        name="CarouselCatalog"
+        component={CarouselCatalogScreen}
+        options={{ title: "Carousel", drawerLabel: "Carousel Catalog" }}
+      />
     </Drawer.Navigator>
   );
 }
